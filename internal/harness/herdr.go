@@ -1,0 +1,509 @@
+package harness
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
+)
+
+// Herdr adapts the Herdr terminal workspace manager as a coding harness.
+// It can route tasks to warm existing agent panes (Claude, Kimi, Hermes, OpenCode, Codex)
+// or dynamically spawn and supervise new agent panes inside Herdr.
+type Herdr struct {
+	config HarnessConfig
+
+	keyMu    sync.Mutex
+	keyLocks map[string]*sync.Mutex
+	mu       sync.Mutex
+	sessions map[string]string
+	active   map[string]*herdrTurn
+	closed   bool
+}
+
+type herdrTurn struct {
+	target    string
+	isDynamic bool
+	cmd       *exec.Cmd
+	cancel    context.CancelFunc
+	done      chan struct{}
+}
+
+type herdrAgentItem struct {
+	Agent       string `json:"agent"`
+	AgentStatus string `json:"agent_status"`
+	PaneID      string `json:"pane_id"`
+	TerminalTitle string `json:"terminal_title_stripped"`
+	AgentSession struct {
+		Value string `json:"value"`
+	} `json:"agent_session"`
+}
+
+type herdrAgentListResponse struct {
+	Result struct {
+		Agents []herdrAgentItem `json:"agents"`
+	} `json:"result"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type herdrAgentGetResponse struct {
+	Result struct {
+		Agent herdrAgentItem `json:"agent"`
+	} `json:"result"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+type herdrPaneSplitResponse struct {
+	Result struct {
+		Pane struct {
+			PaneID string `json:"pane_id"`
+		} `json:"pane"`
+	} `json:"result"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+func NewHerdr(cfg HarnessConfig) (*Herdr, error) {
+	if cfg.Command == "" {
+		cfg.Command = "herdr"
+	}
+	if cfg.Cwd == "" {
+		cfg.Cwd = "."
+	}
+	h := &Herdr{
+		config:   cfg,
+		keyLocks: map[string]*sync.Mutex{},
+		sessions: map[string]string{},
+		active:   map[string]*herdrTurn{},
+	}
+	_ = h.loadSessions()
+	return h, nil
+}
+
+func (h *Herdr) Start(_ context.Context) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return errors.New("Herdr harness is closed")
+	}
+	if _, err := exec.LookPath(h.config.Command); err != nil {
+		return fmt.Errorf("herdr command %q not found in PATH: %w", h.config.Command, err)
+	}
+	// Check Herdr server status
+	cmd := exec.Command(h.config.Command, "status")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "status: running") {
+		return fmt.Errorf("herdr server is not running (output: %s)", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (h *Herdr) Available() (bool, string) {
+	if _, err := exec.LookPath(h.config.Command); err != nil {
+		return false, "herdr binary not found in PATH"
+	}
+	cmd := exec.Command(h.config.Command, "status")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "status: running") {
+		return false, "herdr daemon is not running"
+	}
+	return true, "Herdr daemon running"
+}
+
+func (h *Herdr) ReadyEvents() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	return ch
+}
+
+func (h *Herdr) Models(_ context.Context) ([]Model, error) {
+	// Base canonical agent models known to Herdr
+	baseModels := []struct {
+		id   string
+		name string
+		desc string
+	}{
+		{"claude", "Claude Code", "Anthropic Claude Code in Herdr pane"},
+		{"kimi", "Kimi", "Moonshot Kimi CLI in Herdr pane"},
+		{"opencode", "OpenCode", "OpenCode agent in Herdr pane"},
+		{"hermes", "Hermes", "Hermes agent in Herdr pane"},
+		{"codex", "Codex", "OpenAI Codex CLI in Herdr pane"},
+		{"agy", "Antigravity", "Antigravity CLI in Herdr pane"},
+		{"zcode", "zcode", "zcode agent in Herdr pane"},
+	}
+
+	var models []Model
+	for i, bm := range baseModels {
+		models = append(models, Model{
+			ID:          bm.id,
+			DisplayName: bm.name,
+			Description: bm.desc,
+			Default:     i == 0,
+		})
+	}
+
+	// Query live running agent panes from Herdr
+	cmd := exec.Command(h.config.Command, "agent", "list")
+	out, err := cmd.Output()
+	if err == nil {
+		var resp herdrAgentListResponse
+		if json.Unmarshal(out, &resp) == nil {
+			for _, a := range resp.Result.Agents {
+				displayName := fmt.Sprintf("%s (%s [%s])", a.PaneID, a.Agent, a.AgentStatus)
+				desc := fmt.Sprintf("Live Herdr pane %s running %s (status: %s)", a.PaneID, a.Agent, a.AgentStatus)
+				models = append(models, Model{
+					ID:          a.PaneID,
+					DisplayName: displayName,
+					Description: desc,
+				})
+			}
+		}
+	}
+
+	return models, nil
+}
+
+func (h *Herdr) SetModel(model string) {
+	h.mu.Lock()
+	h.config.Model = model
+	h.mu.Unlock()
+}
+
+func (h *Herdr) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	h.mu.Lock()
+	cfg := h.config
+	cfg.Model = model
+	h.mu.Unlock()
+	return h.sendInternal(ctx, key, prompt, cfg, emit)
+}
+
+func (h *Herdr) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	h.mu.Lock()
+	cfg := h.config
+	h.mu.Unlock()
+	return h.sendInternal(ctx, key, prompt, cfg, emit)
+}
+
+func (h *Herdr) lockForKey(key string) *sync.Mutex {
+	h.keyMu.Lock()
+	defer h.keyMu.Unlock()
+	lock, ok := h.keyLocks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		h.keyLocks[key] = lock
+	}
+	return lock
+}
+
+func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (target string, isDynamic bool, threadID string, err error) {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "default" {
+		model = "claude"
+	}
+
+	// 1. Direct pane target (e.g. "w5:p1")
+	if strings.Contains(model, ":") {
+		return model, false, "", nil
+	}
+
+	// 2. Search for existing idle agent with this kind
+	cmd := exec.CommandContext(ctx, h.config.Command, "agent", "list")
+	out, err := cmd.Output()
+	if err == nil {
+		var listResp herdrAgentListResponse
+		if json.Unmarshal(out, &listResp) == nil {
+			// First look for matching idle agent
+			for _, a := range listResp.Result.Agents {
+				if strings.EqualFold(a.Agent, model) && a.AgentStatus == "idle" {
+					return a.PaneID, false, a.AgentSession.Value, nil
+				}
+			}
+			// Second look for matching done agent that can receive a new turn
+			for _, a := range listResp.Result.Agents {
+				if strings.EqualFold(a.Agent, model) && a.AgentStatus == "done" {
+					return a.PaneID, false, a.AgentSession.Value, nil
+				}
+			}
+		}
+	}
+
+	// 3. If no existing idle agent found, split a dynamic pane and start the agent
+	splitCmd := exec.CommandContext(ctx, h.config.Command, "pane", "split", "--direction", "right", "--no-focus", "--cwd", cwd)
+	splitOut, splitErr := splitCmd.Output()
+	if splitErr != nil {
+		return "", false, "", fmt.Errorf("failed to split herdr pane: %w (out: %s)", splitErr, string(splitOut))
+	}
+
+	var splitResp herdrPaneSplitResponse
+	if err := json.Unmarshal(splitOut, &splitResp); err != nil || splitResp.Result.Pane.PaneID == "" {
+		return "", false, "", fmt.Errorf("failed to parse new pane ID: %s", string(splitOut))
+	}
+	newPaneID := splitResp.Result.Pane.PaneID
+
+	agentName := fmt.Sprintf("spyjo-%s-%d", model, time.Now().Unix())
+	startCmd := exec.CommandContext(ctx, h.config.Command, "agent", "start", agentName, "--kind", model, "--pane", newPaneID)
+	startOut, startErr := startCmd.CombinedOutput()
+	if startErr != nil {
+		// Cleanup pane on failed start
+		_ = exec.Command(h.config.Command, "pane", "close", newPaneID).Run()
+		return "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
+	}
+
+	return newPaneID, true, "", nil
+}
+
+func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", false, errors.New("harness prompt is empty")
+	}
+
+	lock := h.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return "", false, errors.New("Herdr harness is closed")
+	}
+	h.mu.Unlock()
+
+	target, isDynamic, threadID, err := h.resolveTarget(ctx, cfg.Model, cfg.Cwd)
+	if err != nil {
+		return "", false, fmt.Errorf("herdr target resolution: %w", err)
+	}
+
+	if emit != nil {
+		emit(core.Event{
+			Kind: core.EventStatus,
+			Text: fmt.Sprintf("Herdr: routing work to target %s", target),
+		})
+	}
+
+	turnContext, cancel := context.WithCancel(ctx)
+	turn := &herdrTurn{
+		target:    target,
+		isDynamic: isDynamic,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+	}
+
+	h.mu.Lock()
+	h.active[key] = turn
+	h.mu.Unlock()
+
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		delete(h.active, key)
+		h.mu.Unlock()
+		close(turn.done)
+	}()
+
+	// Capture initial baseline output
+	initOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "100").Output()
+	lastSeen := string(initOut)
+
+	// Background streaming ticker
+	streamTicker := time.NewTicker(1500 * time.Millisecond)
+	streamDone := make(chan struct{})
+	go func() {
+		defer streamTicker.Stop()
+		for {
+			select {
+			case <-streamDone:
+				return
+			case <-turnContext.Done():
+				return
+			case <-streamTicker.C:
+				readOut, rErr := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "100").Output()
+				if rErr == nil {
+					curr := string(readOut)
+					if len(curr) > len(lastSeen) && strings.HasPrefix(curr, lastSeen[:min(len(lastSeen), 200)]) {
+						delta := curr[len(lastSeen):]
+						lastSeen = curr
+						if emit != nil && strings.TrimSpace(delta) != "" {
+							emit(core.Event{Kind: core.EventDelta, Text: delta})
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	// Execute prompt with --wait
+	// Default timeout 15 minutes (900000 ms)
+	promptCmd := exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
+	turn.cmd = promptCmd
+	promptOut, promptErr := promptCmd.CombinedOutput()
+
+	close(streamDone)
+
+	// Fetch final terminal output
+	finalOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "250").Output()
+	finalText := strings.TrimSpace(string(finalOut))
+	if finalText == "" {
+		finalText = strings.TrimSpace(string(promptOut))
+	}
+
+	// Inspect final agent state
+	getCmd := exec.Command(h.config.Command, "agent", "get", target)
+	getOut, getErr := getCmd.Output()
+	var agentStatus string
+	if getErr == nil {
+		var getResp herdrAgentGetResponse
+		if json.Unmarshal(getOut, &getResp) == nil {
+			agentStatus = getResp.Result.Agent.AgentStatus
+			if getResp.Result.Agent.AgentSession.Value != "" {
+				threadID = getResp.Result.Agent.AgentSession.Value
+			}
+		}
+	}
+
+	if threadID == "" {
+		threadID = fmt.Sprintf("herdr:%s:%d", target, time.Now().Unix())
+	}
+	h.rememberSession(key, threadID)
+
+	// Evaluate completion
+	if promptErr != nil {
+		errMsg := strings.TrimSpace(string(promptOut))
+		if errMsg == "" {
+			errMsg = promptErr.Error()
+		}
+		if agentStatus == "blocked" || strings.Contains(errMsg, "agent_blocked") {
+			if emit != nil {
+				emit(core.Event{
+					Kind:      core.EventStatus,
+					Text:      "Herdr agent is blocked waiting for user input or approval",
+					ThreadID:  threadID,
+					Execution: &core.ExecutionStatus{State: "blocked", Detail: errMsg},
+				})
+			}
+			return threadID, false, fmt.Errorf("herdr agent %s blocked: %s", target, errMsg)
+		}
+		if emit != nil {
+			emit(core.Event{
+				Kind:      core.EventError,
+				Text:      errMsg,
+				ThreadID:  threadID,
+				Done:      true,
+				Execution: &core.ExecutionStatus{State: "error", Detail: errMsg},
+			})
+		}
+		return threadID, false, fmt.Errorf("herdr prompt failed: %w (out: %s)", promptErr, errMsg)
+	}
+
+	if emit != nil {
+		emit(core.Event{
+			Kind:      core.EventFinal,
+			Text:      finalText,
+			FinalText: &finalText,
+			ThreadID:  threadID,
+			Done:      true,
+			Execution: &core.ExecutionStatus{State: "finishing"},
+		})
+	}
+
+	return threadID, false, nil
+}
+
+func (h *Herdr) rememberSession(key, threadID string) {
+	h.mu.Lock()
+	h.sessions[key] = threadID
+	_ = h.saveSessionsLocked()
+	h.mu.Unlock()
+}
+
+func (h *Herdr) loadSessions() error {
+	if h.config.SessionsFile == "" {
+		return nil
+	}
+	data, err := os.ReadFile(h.config.SessionsFile)
+	if err != nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return json.Unmarshal(data, &h.sessions)
+}
+
+func (h *Herdr) saveSessionsLocked() error {
+	if h.config.SessionsFile == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(h.sessions, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(h.config.SessionsFile), 0700); err != nil {
+		return err
+	}
+	return fsx.AtomicWriteFile(h.config.SessionsFile, data, 0600)
+}
+
+func (h *Herdr) Interrupt(_ context.Context, key string) (bool, error) {
+	lock := h.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	h.mu.Lock()
+	turn := h.active[key]
+	h.mu.Unlock()
+
+	if turn == nil {
+		return false, nil
+	}
+
+	turn.cancel()
+	_ = exec.Command(h.config.Command, "agent", "send-keys", turn.target, "ctrl+c").Run()
+	return true, nil
+}
+
+func (h *Herdr) ResetSession(key string) error {
+	lock := h.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+
+	h.mu.Lock()
+	delete(h.sessions, key)
+	_ = h.saveSessionsLocked()
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *Herdr) ThreadID(key string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sessions[key]
+}
+
+func (h *Herdr) IsActive(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active[key] != nil
+}
+
+func (h *Herdr) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.closed = true
+	for _, turn := range h.active {
+		turn.cancel()
+	}
+	return nil
+}

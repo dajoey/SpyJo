@@ -58,6 +58,11 @@ var catalog = []Definition{
 	acpDefinition("github-copilot", "GitHub Copilot", "copilot", []string{"--acp"}, "GitHub Copilot CLI via ACP", "https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server"),
 	acpDefinition("factory-droid", "Factory Droid", "droid", []string{"exec", "--output-format", "acp-daemon"}, "Factory Droid via ACP", "https://docs.factory.ai/droid-exec/overview", "DROID_DISABLE_AUTO_UPDATE=true", "FACTORY_DROID_AUTO_UPDATE_ENABLED=false"),
 	{
+		Name: "herdr", DisplayName: "Herdr", Command: "herdr", SupportsEffort: false,
+		Description: "Herdr terminal workspace manager for AI coding agents", InstallURL: "https://herdr.dev",
+		factory: func(cfg HarnessConfig) (Harness, error) { return NewHerdr(cfg) },
+	},
+	{
 		Name: "acp", DisplayName: "Custom ACP", Custom: true,
 		Description: "User-configured ACP stdio command", InstallURL: "https://agentclientprotocol.com/protocol/v1/transports",
 		factory: func(cfg HarnessConfig) (Harness, error) { return NewACP(cfg) },
@@ -111,6 +116,8 @@ func StaticCapabilities(name string) (reasoning, service string) {
 		return "per-model catalog", "unsupported"
 	case "agent-zero", "opencode", "qwen-code", "kimi", "goose", "cursor", "gemini-cli", "github-copilot", "factory-droid", "acp":
 		return "unsupported (choices are unavailable before ACP session creation)", "unsupported (no standard ACP speed category)"
+	case "herdr":
+		return "delegated to selected Herdr agent", "unsupported"
 	default:
 		return "unknown", "unknown"
 	}
