@@ -669,3 +669,31 @@ func TestMalformedLeaseCanBeRecovered(t *testing.T) {
 		t.Fatalf("recover malformed lease = %t, %v", acquired, err)
 	}
 }
+
+func TestDeadPIDLeaseIsImmediatelyStale(t *testing.T) {
+	state := t.TempDir()
+	now := time.Now().UTC()
+	election, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	election.now = func() time.Time { return now }
+
+	// Dead PID (PID 99999999 is extraordinarily unlikely to exist)
+	deadLease := Lease{
+		InstanceID:  "dead-instance",
+		PID:         99999999,
+		Endpoint:    "127.0.0.1:10001",
+		Token:       "token",
+		StartedAt:   now,
+		HeartbeatAt: now, // fresh heartbeat, but dead process!
+	}
+
+	if !election.CanTakeOver(deadLease) {
+		t.Fatal("expected dead PID lease to be immediately eligible for takeover")
+	}
+
+	if !election.IsStale(deadLease) {
+		t.Fatal("expected dead PID lease to be stale")
+	}
+}

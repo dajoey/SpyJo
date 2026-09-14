@@ -190,6 +190,9 @@ func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 				return nil
 			}
 		}
+		if current.PID > 0 && current.PID != e.pid && isProcessExeDeleted(current.PID) {
+			terminateObsoleteProcess(current.PID)
+		}
 		result = Lease{
 			InstanceID: e.id, PID: e.pid, Endpoint: endpoint, EnvironmentID: e.environmentID, Token: token,
 			StartedAt: now, HeartbeatAt: now,
@@ -222,7 +225,7 @@ func (e *Election) Renew(token string) (Lease, bool, error) {
 			return nil
 		}
 		now := e.now()
-		if stale(current, now) {
+		if stale(current, now) || isProcessExeDeleted(e.pid) {
 			return nil
 		}
 		// A matching owner term is authoritative for this process. Restore the
@@ -385,7 +388,15 @@ func (e *Election) CanTakeOver(lease Lease) bool {
 }
 
 func stale(lease Lease, now time.Time) bool {
-	return lease.InstanceID == "" || lease.HeartbeatAt.IsZero() || !now.Before(lease.HeartbeatAt.Add(StaleAfter))
+	if lease.InstanceID == "" || lease.HeartbeatAt.IsZero() || !now.Before(lease.HeartbeatAt.Add(StaleAfter)) {
+		return true
+	}
+	if lease.PID > 0 {
+		if !isProcessAlive(lease.PID) || isProcessExeDeleted(lease.PID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Election) withLock(action func() error) error {
