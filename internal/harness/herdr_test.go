@@ -119,46 +119,52 @@ func TestWorkerNameAndLabel(t *testing.T) {
 		{
 			key:          "orchestrator:tasks:task_implementation:tasks-20260914-helm-fleet-update-03:1",
 			model:        "opencode",
-			wantName:     "spyjo-task-opencode-helm-fleet-update-03-a1-worker",
+			wantName:     "sj-t-a1-helm-fleet-update-03",
 			wantTabLabel: "Task: helm-fleet-update-03 (opencode)",
 		},
 		{
 			key:          "orchestrator:tasks:task_review:tasks-20260914-helm-lmc-verify-02:1",
 			model:        "kimi",
-			wantName:     "spyjo-review-kimi-helm-lmc-verify-02-a1-worker",
+			wantName:     "sj-r-a1-helm-lmc-verify-02",
 			wantTabLabel: "Review: helm-lmc-verify-02 (kimi)",
 		},
 		{
 			key:          "orchestrator:goals:planning:goals-20260914-202731-helm01:1",
 			model:        "opencode",
-			wantName:     "spyjo-plan-opencode-helm01-a1-worker",
+			wantName:     "sj-p-a1-helm01",
 			wantTabLabel: "Plan: helm01 (opencode)",
 		},
 		{
 			key:          "orchestrator:semantic-heartbeat",
 			model:        "opencode",
-			wantName:     "spyjo-heartbeat-opencode-worker",
-			wantTabLabel: "Heartbeat (opencode)",
+			wantName:     "sj-hb-opencode",
+			wantTabLabel: "Heartbeat (%s)",
 		},
 		{
 			key:          "chat:tui:local-2a0229b8d17f26ca2335fa4eaaf39397",
 			model:        "opencode",
-			wantName:     "spyjo-chat-tui-opencode-2a0229b8-worker",
-			wantTabLabel: "Chat: 2a0229b8 (opencode)",
+			wantName:     "sj-c-tui-2a0229b8d17f",
+			wantTabLabel: "Chat: 2a0229b8d17f (opencode)",
 		},
 		{
 			key:          "chat:tui:local-71f92e03b302",
 			model:        "opencode",
-			wantName:     "spyjo-chat-tui-opencode-71f92e03-worker",
-			wantTabLabel: "Chat: 71f92e03 (opencode)",
+			wantName:     "sj-c-tui-71f92e03b302",
+			wantTabLabel: "Chat: 71f92e03b302 (opencode)",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
 			gotName, gotLabel := workerNameAndLabel(tc.key, tc.model)
+			if len(gotName) > 32 {
+				t.Errorf("workerNameAndLabel name %q exceeds 32 chars (len=%d)", gotName, len(gotName))
+			}
 			if gotName != tc.wantName {
 				t.Errorf("workerNameAndLabel(%q, %q) name = %q, want %q", tc.key, tc.model, gotName, tc.wantName)
+			}
+			if tc.wantTabLabel == "Heartbeat (%s)" {
+				tc.wantTabLabel = "Heartbeat (opencode)"
 			}
 			if gotLabel != tc.wantTabLabel {
 				t.Errorf("workerNameAndLabel(%q, %q) label = %q, want %q", tc.key, tc.model, gotLabel, tc.wantTabLabel)

@@ -255,7 +255,11 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 	// Background orchestrator jobs
 	if strings.HasPrefix(cleanKey, "orchestrator:") || cleanKey == "heartbeat" {
 		if cleanKey == "orchestrator:semantic-heartbeat" || cleanKey == "heartbeat" {
-			workerName = fmt.Sprintf("spyjo-heartbeat-%s-worker", model)
+			workerName = fmt.Sprintf("sj-hb-%s", model)
+			if len(workerName) > 32 {
+				workerName = workerName[:32]
+			}
+			workerName = strings.Trim(workerName, "-_")
 			tabLabel = fmt.Sprintf("Heartbeat (%s)", model)
 			return
 		}
@@ -275,32 +279,42 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 			shortID = strings.TrimPrefix(shortID, "goals-")
 			shortID = reLeadingDate.ReplaceAllString(shortID, "")
 			shortID = sanitizeTag(shortID)
-			if len(shortID) > 24 {
-				shortID = shortID[:24]
-			}
 			shortID = strings.Trim(shortID, "-_")
 			if shortID == "" {
 				shortID = "job"
 			}
 
-			phasePrefix := "task"
+			phaseCode := "t"
 			phaseLabel := "Task"
 			switch {
 			case strings.Contains(phase, "impl"):
-				phasePrefix = "task"
+				phaseCode = "t"
 				phaseLabel = "Task"
 			case strings.Contains(phase, "rev"):
-				phasePrefix = "review"
+				phaseCode = "r"
 				phaseLabel = "Review"
 			case strings.Contains(phase, "plan"):
-				phasePrefix = "plan"
+				phaseCode = "p"
 				phaseLabel = "Plan"
 			default:
-				phasePrefix = "orch"
+				phaseCode = "o"
 				phaseLabel = "Task"
 			}
 
-			workerName = fmt.Sprintf("spyjo-%s-%s-%s-a%s-worker", phasePrefix, model, shortID, attempt)
+			// Herdr limits agent names to 1-32 lowercase characters [a-z0-9_-]
+			prefix := fmt.Sprintf("sj-%s-a%s-", phaseCode, attempt)
+			maxIDLen := 32 - len(prefix)
+			nameID := shortID
+			if maxIDLen > 0 && len(nameID) > maxIDLen {
+				nameID = nameID[:maxIDLen]
+			}
+			nameID = strings.Trim(nameID, "-_")
+
+			workerName = prefix + nameID
+			if len(workerName) > 32 {
+				workerName = workerName[:32]
+			}
+			workerName = strings.Trim(workerName, "-_")
 			tabLabel = fmt.Sprintf("%s: %s (%s)", phaseLabel, shortID, model)
 			return
 		}
@@ -309,7 +323,11 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 		if len(sanitized) > 20 {
 			sanitized = sanitized[len(sanitized)-20:]
 		}
-		workerName = fmt.Sprintf("spyjo-orch-%s-%s-worker", model, sanitized)
+		workerName = fmt.Sprintf("sj-o-%s", sanitized)
+		if len(workerName) > 32 {
+			workerName = workerName[:32]
+		}
+		workerName = strings.Trim(workerName, "-_")
 		tabLabel = fmt.Sprintf("Task (%s)", model)
 		return
 	}
@@ -328,28 +346,36 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 
 		shortConv := conv
 		shortConv = strings.TrimPrefix(shortConv, "local-")
-		if len(shortConv) > 8 {
-			shortConv = shortConv[:8]
-		}
 		shortConv = sanitizeTag(shortConv)
+		if len(shortConv) > 12 {
+			shortConv = shortConv[:12]
+		}
 		if shortConv == "" {
 			shortConv = "main"
 		}
 
-		workerName = fmt.Sprintf("spyjo-chat-%s-%s-%s-worker", channel, model, shortConv)
+		workerName = fmt.Sprintf("sj-c-%s-%s", channel, shortConv)
+		if len(workerName) > 32 {
+			workerName = workerName[:32]
+		}
+		workerName = strings.Trim(workerName, "-_")
 		tabLabel = fmt.Sprintf("Chat: %s (%s)", shortConv, model)
 		return
 	}
 
 	// Generic fallback
 	sanitized := sanitizeTag(cleanKey)
-	if len(sanitized) > 16 {
-		sanitized = sanitized[:16]
+	if len(sanitized) > 24 {
+		sanitized = sanitized[:24]
 	}
 	if sanitized == "" {
 		sanitized = "worker"
 	}
-	workerName = fmt.Sprintf("spyjo-%s-%s-worker", model, sanitized)
+	workerName = fmt.Sprintf("sj-%s", sanitized)
+	if len(workerName) > 32 {
+		workerName = workerName[:32]
+	}
+	workerName = strings.Trim(workerName, "-_")
 	tabLabel = fmt.Sprintf("SpyJo (%s)", model)
 	return
 }
@@ -381,7 +407,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 		if json.Unmarshal(out, &listResp) == nil {
 			for _, a := range listResp.Result.Agents {
 				inWorkspace := workspaceID == "" || a.WorkspaceID == workspaceID || strings.HasPrefix(a.PaneID, workspaceID+":")
-				isSpyJoWorker := a.Name == expectedWorkerName || (strings.HasPrefix(a.Name, "spyjo-") && strings.HasSuffix(a.Name, "-worker"))
+				isSpyJoWorker := a.Name == expectedWorkerName || strings.HasPrefix(a.Name, "spyjo-") || strings.HasPrefix(a.Name, "sj-")
 
 				// STRICT IMMUNITY: Never touch external fleet panes (w1, w2, w4, w5, etc.)!
 				if !inWorkspace && !isSpyJoWorker {
