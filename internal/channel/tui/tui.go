@@ -258,6 +258,7 @@ type model struct {
 	clipboardFallback        bool
 	editorNotice             string
 	writeClipboard           io.Writer
+	herdr                    *herdrReporter
 	status                   string
 	width                    int
 	height                   int
@@ -477,6 +478,24 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	if options.RegisterLive != nil {
 		go renewLiveTUI(liveCtx, options.RegisterLive, liveConversation.Get)
 	}
+	reporter := newHerdrReporter()
+	if reporter != nil {
+		defer reporter.Release()
+		reporter.ReportSession(conversation, "")
+		reporter.ReportState("idle", conversation, "Ready")
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-liveCtx.Done():
+					return
+				case <-ticker.C:
+					reporter.Heartbeat(liveConversation.Get())
+				}
+			}
+		}()
+	}
 	initialTranscript := transcriptFromHistory(initialHistory)
 	m := model{
 		ctx: ctx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
@@ -518,6 +537,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		connection:           connectionMap(options.InitialConnections),
 		status:               "Ready", conversation: conversation, liveConversation: liveConversation,
 		initialHistoryScroll: len(initialTranscript) > 0,
+		herdr:                reporter,
 	}
 	if options.InitialScreen != nil {
 		m.openScreen(*options.InitialScreen)
@@ -1543,7 +1563,19 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if command := m.requestHistoryRender(); command != nil {
 		commands = append(commands, command)
 	}
+	m.syncHerdr()
 	return m, tea.Batch(commands...)
+}
+
+func (m *model) syncHerdr() {
+	if m.herdr == nil {
+		return
+	}
+	state := "idle"
+	if m.working {
+		state = "working"
+	}
+	m.herdr.ReportState(state, m.conversation, m.status)
 }
 
 func safeNotificationBoundary(text string) bool {
@@ -1819,6 +1851,7 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 	m.status = "Sending…"
 	m.resizeComposer()
 	m.refresh()
+	m.syncHerdr()
 	sourceMessageID, _ := core.NewSourceMessageID()
 	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", SourceMessageID: sourceMessageID, Text: messageText, ReceivedAt: time.Now().UTC()}
 	handler := m.handler
@@ -3564,6 +3597,10 @@ func (m *model) openScreen(screen core.Screen) {
 		m.conversation = screen.Conversation
 		if m.liveConversation != nil {
 			m.liveConversation.Set(screen.Conversation)
+		}
+		if m.herdr != nil {
+			m.herdr.ReportSession(screen.Conversation, "")
+			m.herdr.ReportState("idle", screen.Conversation, "Resumed")
 		}
 		m.welcome = nil
 		m.welcomeFocus = false
