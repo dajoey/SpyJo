@@ -33,6 +33,8 @@ type Herdr struct {
 
 type herdrTurn struct {
 	target    string
+	paneID    string
+	tabID     string
 	isDynamic bool
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
@@ -44,6 +46,7 @@ type herdrAgentItem struct {
 	Agent         string `json:"agent"`
 	AgentStatus   string `json:"agent_status"`
 	PaneID        string `json:"pane_id"`
+	TabID         string `json:"tab_id"`
 	WorkspaceID   string `json:"workspace_id"`
 	Cwd           string `json:"cwd"`
 	TerminalTitle string `json:"terminal_title_stripped"`
@@ -112,7 +115,7 @@ func NewHerdr(cfg HarnessConfig) (*Herdr, error) {
 	return h, nil
 }
 
-func (h *Herdr) Start(_ context.Context) error {
+func (h *Herdr) Start(ctx context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
@@ -127,6 +130,7 @@ func (h *Herdr) Start(_ context.Context) error {
 	if err != nil || !strings.Contains(string(out), "status: running") {
 		return fmt.Errorf("herdr server is not running (output: %s)", strings.TrimSpace(string(out)))
 	}
+	go h.sweepOrphanedWorkers(ctx)
 	return nil
 }
 
@@ -380,7 +384,7 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 	return
 }
 
-func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd string) (target string, paneID string, isDynamic bool, threadID string, err error) {
+func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd string) (target string, paneID string, tabID string, isDynamic bool, threadID string, err error) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "default" {
 		model = "opencode"
@@ -388,7 +392,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 
 	// 1. Direct explicit pane target (e.g. "w8:p2")
 	if strings.Contains(model, ":") {
-		return model, model, false, "", nil
+		return model, model, "", false, "", nil
 	}
 
 	callerPane, workspaceID := h.resolveCallerContext(ctx, cwd)
@@ -419,7 +423,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 					if a.AgentStatus == "blocked" {
 						_ = exec.CommandContext(ctx, h.config.Command, "agent", "send-keys", a.Name, "esc").Run()
 					}
-					return a.Name, a.PaneID, false, a.AgentSession.Value, nil
+					return a.Name, a.PaneID, a.TabID, false, a.AgentSession.Value, nil
 				}
 			}
 		}
@@ -452,11 +456,11 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 		splitCmd := exec.CommandContext(ctx, h.config.Command, splitArgs...)
 		splitOut, splitErr := splitCmd.Output()
 		if splitErr != nil {
-			return "", "", false, "", fmt.Errorf("failed to spawn dedicated worker (tab and split failed): %w (out: %s)", splitErr, string(splitOut))
+			return "", "", "", false, "", fmt.Errorf("failed to spawn dedicated worker (tab and split failed): %w (out: %s)", splitErr, string(splitOut))
 		}
 		var splitResp herdrPaneSplitResponse
 		if err := json.Unmarshal(splitOut, &splitResp); err != nil || splitResp.Result.Pane.PaneID == "" {
-			return "", "", false, "", fmt.Errorf("failed to parse new pane ID from herdr: %s", string(splitOut))
+			return "", "", "", false, "", fmt.Errorf("failed to parse new pane ID from herdr: %s", string(splitOut))
 		}
 		newPaneID = splitResp.Result.Pane.PaneID
 	}
@@ -473,7 +477,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 		} else {
 			_ = exec.Command(h.config.Command, "pane", "close", newPaneID).Run()
 		}
-		return "", "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
+		return "", "", "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
 	}
 
 	getCmd := exec.CommandContext(ctx, h.config.Command, "agent", "get", expectedWorkerName)
@@ -486,7 +490,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 	// Brief settle pause to let agent terminal finish initialization and input binding
 	time.Sleep(1500 * time.Millisecond)
 
-	return expectedWorkerName, newPaneID, true, threadID, nil
+	return expectedWorkerName, newPaneID, createdTabID, true, threadID, nil
 }
 
 func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
@@ -505,7 +509,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	}
 	h.mu.Unlock()
 
-	target, paneID, isDynamic, threadID, err := h.resolveTarget(ctx, key, cfg.Model, cfg.Cwd)
+	target, paneID, tabID, isDynamic, threadID, err := h.resolveTarget(ctx, key, cfg.Model, cfg.Cwd)
 	if err != nil {
 		return "", false, fmt.Errorf("herdr target resolution: %w", err)
 	}
@@ -524,6 +528,8 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	turnContext, cancel := context.WithCancel(ctx)
 	turn := &herdrTurn{
 		target:    target,
+		paneID:    paneID,
+		tabID:     tabID,
 		isDynamic: isDynamic,
 		cancel:    cancel,
 		done:      make(chan struct{}),
@@ -533,12 +539,16 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	h.active[key] = turn
 	h.mu.Unlock()
 
+	cleanKey := strings.TrimSpace(key)
 	defer func() {
 		cancel()
 		h.mu.Lock()
 		delete(h.active, key)
 		h.mu.Unlock()
 		close(turn.done)
+		if isOrchestratorKey(cleanKey) {
+			go h.cleanupCompletedTab(tabID, paneID, target)
+		}
 	}()
 
 	// Background status ticker while agent is processing prompt
@@ -871,3 +881,114 @@ func (h *Herdr) Close() error {
 	}
 	return nil
 }
+
+func isOrchestratorKey(key string) bool {
+	return strings.HasPrefix(key, "orchestrator:") || key == "heartbeat" || strings.HasPrefix(key, "test-")
+}
+
+func (h *Herdr) tabExists(tabID string) bool {
+	if tabID == "" {
+		return false
+	}
+	cmd := exec.Command(h.config.Command, "tab", "get", tabID)
+	return cmd.Run() == nil
+}
+
+func (h *Herdr) isTabFocused(tabID string) bool {
+	if tabID == "" {
+		return false
+	}
+	out, err := exec.Command(h.config.Command, "tab", "get", tabID).Output()
+	if err != nil {
+		return false
+	}
+	var resp struct {
+		Result struct {
+			Tab struct {
+				Focused bool `json:"focused"`
+			} `json:"tab"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return false
+	}
+	return resp.Result.Tab.Focused
+}
+
+// cleanupCompletedTab closes a dynamic worker tab once its turn finishes.
+// If the user is currently focused on the tab, it waits until they switch away
+// before closing so that output is not pulled out from under their eyes.
+func (h *Herdr) cleanupCompletedTab(tabID, paneID, agentName string) {
+	if tabID == "" && paneID == "" {
+		return
+	}
+
+	// Brief initial settle pause before checking focus or closing
+	time.Sleep(1500 * time.Millisecond)
+
+	if tabID != "" {
+		deadline := time.Now().Add(5 * time.Minute)
+		for time.Now().Before(deadline) {
+			h.mu.Lock()
+			closed := h.closed
+			h.mu.Unlock()
+			if closed {
+				return
+			}
+
+			// If tab was already closed or removed, nothing more to do
+			if !h.tabExists(tabID) {
+				return
+			}
+
+			// If tab is no longer focused, break and proceed to close
+			if !h.isTabFocused(tabID) {
+				break
+			}
+			time.Sleep(1500 * time.Millisecond)
+		}
+
+		_ = exec.Command(h.config.Command, "tab", "close", tabID).Run()
+	} else if paneID != "" {
+		_ = exec.Command(h.config.Command, "pane", "close", paneID).Run()
+	}
+
+	if agentName != "" {
+		_ = exec.Command(h.config.Command, "agent", "rename", agentName, "--clear").Run()
+	}
+}
+
+// sweepOrphanedWorkers cleans up any abandoned worker tabs or agent registrations
+// from previous crashed or aborted sessions in this workspace on startup.
+func (h *Herdr) sweepOrphanedWorkers(ctx context.Context) {
+	_, workspaceID := h.resolveCallerContext(ctx, h.config.Cwd)
+	out, err := exec.CommandContext(ctx, h.config.Command, "agent", "list").Output()
+	if err != nil {
+		return
+	}
+	var listResp herdrAgentListResponse
+	if err := json.Unmarshal(out, &listResp); err != nil {
+		return
+	}
+	for _, a := range listResp.Result.Agents {
+		inWorkspace := workspaceID == "" || a.WorkspaceID == workspaceID || strings.HasPrefix(a.PaneID, workspaceID+":")
+		if !inWorkspace {
+			continue
+		}
+		// Only sweep background worker agents (not chat sj-c-*, not external agents)
+		isOrphanWorker := strings.HasPrefix(a.Name, "sj-t-") ||
+			strings.HasPrefix(a.Name, "sj-r-") ||
+			strings.HasPrefix(a.Name, "sj-o-") ||
+			strings.HasPrefix(a.Name, "sj-hb-")
+		if !isOrphanWorker {
+			continue
+		}
+		if a.TabID != "" {
+			_ = exec.Command(h.config.Command, "tab", "close", a.TabID).Run()
+		} else if a.PaneID != "" {
+			_ = exec.Command(h.config.Command, "pane", "close", a.PaneID).Run()
+		}
+		_ = exec.Command(h.config.Command, "agent", "rename", a.Name, "--clear").Run()
+	}
+}
+
