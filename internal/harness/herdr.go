@@ -40,11 +40,14 @@ type herdrTurn struct {
 }
 
 type herdrAgentItem struct {
-	Agent       string `json:"agent"`
-	AgentStatus string `json:"agent_status"`
-	PaneID      string `json:"pane_id"`
+	Name          string `json:"name"`
+	Agent         string `json:"agent"`
+	AgentStatus   string `json:"agent_status"`
+	PaneID        string `json:"pane_id"`
+	WorkspaceID   string `json:"workspace_id"`
+	Cwd           string `json:"cwd"`
 	TerminalTitle string `json:"terminal_title_stripped"`
-	AgentSession struct {
+	AgentSession  struct {
 		Value string `json:"value"`
 	} `json:"agent_session"`
 }
@@ -132,50 +135,14 @@ func (h *Herdr) ReadyEvents() <-chan struct{} {
 }
 
 func (h *Herdr) Models(_ context.Context) ([]Model, error) {
-	// Base canonical agent models known to Herdr
-	baseModels := []struct {
-		id   string
-		name string
-		desc string
-	}{
-		{"claude", "Claude Code", "Anthropic Claude Code in Herdr pane"},
-		{"kimi", "Kimi", "Moonshot Kimi CLI in Herdr pane"},
-		{"opencode", "OpenCode", "OpenCode agent in Herdr pane"},
-		{"hermes", "Hermes", "Hermes agent in Herdr pane"},
-		{"codex", "Codex", "OpenAI Codex CLI in Herdr pane"},
-		{"agy", "Antigravity", "Antigravity CLI in Herdr pane"},
-		{"zcode", "zcode", "zcode agent in Herdr pane"},
-	}
-
-	var models []Model
-	for i, bm := range baseModels {
-		models = append(models, Model{
-			ID:          bm.id,
-			DisplayName: bm.name,
-			Description: bm.desc,
-			Default:     i == 0,
-		})
-	}
-
-	// Query live running agent panes from Herdr
-	cmd := exec.Command(h.config.Command, "agent", "list")
-	out, err := cmd.Output()
-	if err == nil {
-		var resp herdrAgentListResponse
-		if json.Unmarshal(out, &resp) == nil {
-			for _, a := range resp.Result.Agents {
-				displayName := fmt.Sprintf("%s (%s [%s])", a.PaneID, a.Agent, a.AgentStatus)
-				desc := fmt.Sprintf("Live Herdr pane %s running %s (status: %s)", a.PaneID, a.Agent, a.AgentStatus)
-				models = append(models, Model{
-					ID:          a.PaneID,
-					DisplayName: displayName,
-					Description: desc,
-				})
-			}
-		}
-	}
-
-	return models, nil
+	allEfforts := []string{"low", "medium", "high"}
+	return []Model{
+		{ID: "opencode", DisplayName: "OpenCode", Description: "Dedicated OpenCode worker in Herdr pane (default)", Default: true, Efforts: allEfforts},
+		{ID: "claude", DisplayName: "Claude Code", Description: "Dedicated Claude Code worker in Herdr pane", Efforts: allEfforts},
+		{ID: "codex", DisplayName: "Codex", Description: "Dedicated Codex worker in Herdr pane", Efforts: allEfforts},
+		{ID: "kimi", DisplayName: "Kimi", Description: "Dedicated Kimi CLI worker in Herdr pane", Efforts: allEfforts},
+		{ID: "hermes", DisplayName: "Hermes", Description: "Dedicated Hermes worker in Herdr pane", Efforts: allEfforts},
+	}, nil
 }
 
 func (h *Herdr) SetModel(model string) {
@@ -210,61 +177,126 @@ func (h *Herdr) lockForKey(key string) *sync.Mutex {
 	return lock
 }
 
-func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (target string, isDynamic bool, threadID string, err error) {
+func (h *Herdr) resolveCallerContext(ctx context.Context, cwd string) (string, string) {
+	callerPane := os.Getenv("HERDR_PANE_ID")
+	workspaceID := os.Getenv("HERDR_WORKSPACE_ID")
+
+	if callerPane != "" && workspaceID != "" {
+		return callerPane, workspaceID
+	}
+
+	out, err := exec.CommandContext(ctx, h.config.Command, "pane", "current").Output()
+	if err == nil {
+		var resp struct {
+			Result struct {
+				Pane struct {
+					PaneID      string `json:"pane_id"`
+					WorkspaceID string `json:"workspace_id"`
+				} `json:"pane"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(out, &resp) == nil && resp.Result.Pane.PaneID != "" {
+			if callerPane == "" {
+				callerPane = resp.Result.Pane.PaneID
+			}
+			if workspaceID == "" {
+				workspaceID = resp.Result.Pane.WorkspaceID
+			}
+		}
+	}
+
+	if workspaceID == "" {
+		workspaceID = "w8"
+	}
+	return callerPane, workspaceID
+}
+
+func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (target string, paneID string, isDynamic bool, threadID string, err error) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "default" {
-		model = "claude"
+		model = "opencode"
 	}
 
-	// 1. Direct pane target (e.g. "w5:p1")
+	// 1. Direct explicit pane target (e.g. "w8:p2")
 	if strings.Contains(model, ":") {
-		return model, false, "", nil
+		return model, model, false, "", nil
 	}
 
-	// 2. Search for existing idle agent with this kind
+	callerPane, workspaceID := h.resolveCallerContext(ctx, cwd)
+	expectedWorkerName := fmt.Sprintf("spyjo-%s-worker", model)
+
+	absCwd := cwd
+	if abs, err := filepath.Abs(cwd); err == nil {
+		absCwd = abs
+	}
+
+	// 2. Search for existing dedicated worker agent in this workspace
 	cmd := exec.CommandContext(ctx, h.config.Command, "agent", "list")
 	out, err := cmd.Output()
 	if err == nil {
 		var listResp herdrAgentListResponse
 		if json.Unmarshal(out, &listResp) == nil {
-			// First look for matching idle agent
 			for _, a := range listResp.Result.Agents {
-				if strings.EqualFold(a.Agent, model) && a.AgentStatus == "idle" {
-					return a.PaneID, false, a.AgentSession.Value, nil
+				inWorkspace := workspaceID == "" || a.WorkspaceID == workspaceID || strings.HasPrefix(a.PaneID, workspaceID+":")
+				isSpyJoWorker := a.Name == expectedWorkerName || (strings.HasPrefix(a.Name, "spyjo-") && strings.HasSuffix(a.Name, "-worker"))
+
+				// STRICT IMMUNITY: Never touch external fleet panes (w1, w2, w4, w5, etc.)!
+				if !inWorkspace && !isSpyJoWorker {
+					continue
 				}
-			}
-			// Second look for matching done agent that can receive a new turn
-			for _, a := range listResp.Result.Agents {
-				if strings.EqualFold(a.Agent, model) && a.AgentStatus == "done" {
-					return a.PaneID, false, a.AgentSession.Value, nil
+
+				// If matching worker agent exists in this workspace
+				if a.Name == expectedWorkerName && inWorkspace {
+					if a.AgentStatus == "blocked" {
+						_ = exec.CommandContext(ctx, h.config.Command, "agent", "send-keys", a.Name, "esc").Run()
+					}
+					return a.Name, a.PaneID, false, a.AgentSession.Value, nil
+				}
+
+				// If an old worker with a different model exists in this workspace, clean it up
+				if isSpyJoWorker && inWorkspace && a.Name != expectedWorkerName {
+					_ = exec.CommandContext(ctx, h.config.Command, "pane", "close", a.PaneID).Run()
 				}
 			}
 		}
 	}
 
-	// 3. If no existing idle agent found, split a dynamic pane and start the agent
-	splitCmd := exec.CommandContext(ctx, h.config.Command, "pane", "split", "--direction", "right", "--no-focus", "--cwd", cwd)
+	// 3. Spawn a dedicated worker pane via split
+	splitArgs := []string{"pane", "split", "--direction", "right", "--ratio", "0.5", "--cwd", absCwd, "--no-focus"}
+	if callerPane != "" {
+		splitArgs = append(splitArgs, "--pane", callerPane)
+	}
+
+	splitCmd := exec.CommandContext(ctx, h.config.Command, splitArgs...)
 	splitOut, splitErr := splitCmd.Output()
 	if splitErr != nil {
-		return "", false, "", fmt.Errorf("failed to split herdr pane: %w (out: %s)", splitErr, string(splitOut))
+		return "", "", false, "", fmt.Errorf("failed to split dedicated worker pane: %w (out: %s)", splitErr, string(splitOut))
 	}
 
 	var splitResp herdrPaneSplitResponse
 	if err := json.Unmarshal(splitOut, &splitResp); err != nil || splitResp.Result.Pane.PaneID == "" {
-		return "", false, "", fmt.Errorf("failed to parse new pane ID: %s", string(splitOut))
+		return "", "", false, "", fmt.Errorf("failed to parse new pane ID from herdr: %s", string(splitOut))
 	}
 	newPaneID := splitResp.Result.Pane.PaneID
 
-	agentName := fmt.Sprintf("spyjo-%s-%d", model, time.Now().Unix())
-	startCmd := exec.CommandContext(ctx, h.config.Command, "agent", "start", agentName, "--kind", model, "--pane", newPaneID)
+	// 4. Start the agent in the new pane
+	startArgs := []string{"agent", "start", expectedWorkerName, "--kind", model, "--pane", newPaneID, "--timeout", "45000"}
+	startCmd := exec.CommandContext(ctx, h.config.Command, startArgs...)
 	startOut, startErr := startCmd.CombinedOutput()
 	if startErr != nil {
-		// Cleanup pane on failed start
 		_ = exec.Command(h.config.Command, "pane", "close", newPaneID).Run()
-		return "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
+		return "", "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
 	}
 
-	return newPaneID, true, "", nil
+	getCmd := exec.CommandContext(ctx, h.config.Command, "agent", "get", expectedWorkerName)
+	if getOut, getErr := getCmd.Output(); getErr == nil {
+		var getResp herdrAgentGetResponse
+		if json.Unmarshal(getOut, &getResp) == nil {
+			threadID = getResp.Result.Agent.AgentSession.Value
+		}
+	}
+
+	return expectedWorkerName, newPaneID, true, threadID, nil
 }
 
 func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
@@ -283,15 +315,19 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	}
 	h.mu.Unlock()
 
-	target, isDynamic, threadID, err := h.resolveTarget(ctx, cfg.Model, cfg.Cwd)
+	target, paneID, isDynamic, threadID, err := h.resolveTarget(ctx, cfg.Model, cfg.Cwd)
 	if err != nil {
 		return "", false, fmt.Errorf("herdr target resolution: %w", err)
 	}
 
 	if emit != nil {
+		statusMsg := fmt.Sprintf("Herdr: routing work to dedicated worker %s in %s", target, paneID)
+		if isDynamic {
+			statusMsg = fmt.Sprintf("Herdr: spawned dedicated worker %s in %s (cwd: %s)", target, paneID, cfg.Cwd)
+		}
 		emit(core.Event{
 			Kind: core.EventStatus,
-			Text: fmt.Sprintf("Herdr: routing work to target %s", target),
+			Text: statusMsg,
 		})
 	}
 
@@ -395,12 +431,17 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 			errMsg = promptErr.Error()
 		}
 		if agentStatus == "blocked" || strings.Contains(errMsg, "agent_blocked") {
+			readOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "30").Output()
+			blockedDetail := strings.TrimSpace(string(readOut))
+			if blockedDetail == "" {
+				blockedDetail = errMsg
+			}
 			if emit != nil {
 				emit(core.Event{
 					Kind:      core.EventStatus,
-					Text:      "Herdr agent is blocked waiting for user input or approval",
+					Text:      fmt.Sprintf("Herdr worker %s is blocked in %s: %s", target, paneID, blockedDetail),
 					ThreadID:  threadID,
-					Execution: &core.ExecutionStatus{State: "blocked", Detail: errMsg},
+					Execution: &core.ExecutionStatus{State: "blocked", Detail: blockedDetail},
 				})
 			}
 			return threadID, false, fmt.Errorf("herdr agent %s blocked: %s", target, errMsg)
