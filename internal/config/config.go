@@ -647,7 +647,19 @@ func (c Config) TelegramToken() string {
 		return c.Channels.Telegram.Token
 	}
 	if c.Channels.Telegram.TokenEnv != "" {
-		return os.Getenv(c.Channels.Telegram.TokenEnv)
+		if val := os.Getenv(c.Channels.Telegram.TokenEnv); val != "" {
+			return val
+		}
+		cachePath := fmt.Sprintf("/dev/shm/.hermes-secrets-%d.env", os.Getuid())
+		if data, err := os.ReadFile(cachePath); err == nil {
+			prefix := c.Channels.Telegram.TokenEnv + "="
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, prefix) {
+					return strings.Trim(strings.TrimPrefix(line, prefix), `"'`)
+				}
+			}
+		}
 	}
 	return ""
 }

@@ -269,6 +269,17 @@ func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 		// A system service's implicit root user does not receive login variables.
 		serviceEnvironment = "User=root\n"
 	}
+	localBin := filepath.Join(m.Home, ".local", "bin")
+	servicePath := localBin + ":/usr/local/bin:/usr/bin:/bin"
+	if p := os.Getenv("PATH"); p != "" {
+		if !strings.Contains(p, localBin) {
+			servicePath = localBin + ":" + p
+		} else {
+			servicePath = p
+		}
+	}
+	serviceEnvironment += "Environment=" + systemdQuote("PATH="+servicePath) + "\n"
+	serviceEnvironment += "EnvironmentFile=-/dev/shm/.hermes-secrets-%U.env\n"
 	environment := m.environment()
 	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
 		if value, ok := environment[key]; ok {

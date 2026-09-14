@@ -225,7 +225,32 @@ func (h *Herdr) resolveCallerContext(ctx context.Context, cwd string) (string, s
 	}
 
 	if workspaceID == "" {
-		workspaceID = "w8"
+		if outWorkspaces, err := exec.CommandContext(ctx, h.config.Command, "workspace", "list").Output(); err == nil {
+			var wResp struct {
+				Result struct {
+					Workspaces []struct {
+						WorkspaceID string `json:"workspace_id"`
+						Label       string `json:"label"`
+					} `json:"workspaces"`
+				} `json:"result"`
+			}
+			if json.Unmarshal(outWorkspaces, &wResp) == nil {
+				for _, ws := range wResp.Result.Workspaces {
+					lower := strings.ToLower(ws.Label)
+					if strings.Contains(lower, "spyjo") || strings.Contains(lower, "spy") {
+						workspaceID = ws.WorkspaceID
+						break
+					}
+				}
+				if workspaceID == "" && len(wResp.Result.Workspaces) > 0 {
+					workspaceID = wResp.Result.Workspaces[0].WorkspaceID
+				}
+			}
+		}
+	}
+
+	if workspaceID == "" {
+		workspaceID = "w6"
 	}
 	return callerPane, workspaceID
 }
