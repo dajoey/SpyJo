@@ -36,6 +36,8 @@ func Settings(cfg Config) []Setting {
 		{Key: "workspace.history_char_limit", Section: "config", Description: "Maximum total history characters passed to the harness", Value: strconv.Itoa(cfg.Workspace.HistoryCharLimit)},
 		{Key: "startup.enabled", Section: "config", Description: "Autostart preference; setting it registers or removes this workspace's service and verifies the result, even when unchanged", Value: formatBool(cfg.Startup.Enabled), Choices: []string{"on", "off"}},
 		{Key: "harness.chat_agent_prefix", Section: "harness", Description: "Optionally prefix communication-agent messages with harness-native commands like `/goal`", Value: cfg.Harness.ChatAgentPrefix, Advanced: true},
+		{Key: "harness.developer_model", Section: "harness", Description: "Dedicated agent model for task implementation and goal planning", Value: cfg.Harness.DeveloperModel, Advanced: true},
+		{Key: "harness.reviewer_model", Section: "harness", Description: "Dedicated agent model for independent task reviews", Value: cfg.Harness.ReviewerModel, Advanced: true},
 		{Key: "harness.developer_agent_prefix", Section: "harness", Description: "Optionally prefix implementation and planning agent messages with harness-native commands like `/goal`", Value: cfg.Harness.DeveloperAgentPrefix, Advanced: true},
 		{Key: "harness.reviewer_agent_prefix", Section: "harness", Description: "Optionally prefix task and goal reviewer messages with harness-native commands like `/goal`", Value: cfg.Harness.ReviewerAgentPrefix, Advanced: true},
 		{Key: "harness.heartbeat_agent_prefix", Section: "harness", Description: "Optionally prefix semantic-heartbeat audit agent messages with harness-native commands like `/goal`", Value: cfg.Harness.HeartbeatAgentPrefix, Advanced: true},
@@ -209,6 +211,10 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Harness.Sandbox = normalizeSandbox(value)
 	case "harness.chat_agent_prefix":
 		cfg.Harness.ChatAgentPrefix = value
+	case "harness.developer_model":
+		cfg.Harness.DeveloperModel = value
+	case "harness.reviewer_model":
+		cfg.Harness.ReviewerModel = value
 	case "harness.developer_agent_prefix":
 		cfg.Harness.DeveloperAgentPrefix = value
 	case "harness.reviewer_agent_prefix":

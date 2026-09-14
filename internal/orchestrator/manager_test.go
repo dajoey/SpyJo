@@ -799,3 +799,45 @@ func TestTaskNotificationDecisionCoversTerminalAndActionableWaitingTransitions(t
 		})
 	}
 }
+
+func TestResolveTargetModel(t *testing.T) {
+	dir := t.TempDir()
+	taskPath := filepath.Join(dir, "task.md")
+	content := []byte("---\nid: test-task\nagent: hermes\nstatus: working\n---\n# Test Task\n")
+	if err := os.WriteFile(taskPath, content, 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	cfg := config.Config{
+		Harness: config.Harness{
+			Name:           "herdr",
+			Model:          "opencode",
+			DeveloperModel: "opencode",
+			ReviewerModel:  "kimi",
+		},
+	}
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+
+	// 1. Implementation phase uses task frontmatter "agent: hermes"
+	leaseWorking := Lease{File: taskPath, Phase: "working"}
+	if got := manager.resolveTargetModel(workflowRoute{Name: "tasks"}, leaseWorking); got != "hermes" {
+		t.Errorf("expected target model 'hermes', got %q", got)
+	}
+
+	// 2. Review phase automatically uses ReviewerModel ("kimi")
+	leaseReview := Lease{File: taskPath, Phase: phaseTaskReview}
+	if got := manager.resolveTargetModel(workflowRoute{Name: "tasks"}, leaseReview); got != "kimi" {
+		t.Errorf("expected target model 'kimi' for review phase, got %q", got)
+	}
+
+	// 3. Task without agent frontmatter falls back to DeveloperModel ("opencode")
+	taskNoAgent := filepath.Join(dir, "task-no-agent.md")
+	if err := os.WriteFile(taskNoAgent, []byte("---\nid: test-2\nstatus: working\n---\n"), 0600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	leaseNoAgent := Lease{File: taskNoAgent, Phase: "working"}
+	if got := manager.resolveTargetModel(workflowRoute{Name: "tasks"}, leaseNoAgent); got != "opencode" {
+		t.Errorf("expected target model 'opencode', got %q", got)
+	}
+}
+

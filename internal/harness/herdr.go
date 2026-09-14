@@ -481,21 +481,42 @@ var (
 		regexp.MustCompile(`(?m)^.*ctrl\+p commands.*$`),
 		regexp.MustCompile(`(?m)^\s*●\s+Login expired.*$`),
 		regexp.MustCompile(`(?m)^\s*⏵⏵\s+bypass permissions.*$`),
+		regexp.MustCompile(`(?m)^\s*Ask When Needed.*$`),
+		regexp.MustCompile(`(?m)^\s*context:\s*\d+%.*$`),
+		regexp.MustCompile(`(?m)^\s*⚕\s+k\d+.*$`),
+		regexp.MustCompile(`(?m)^\s*❯\s+Ask anything.*$`),
 		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
 	}
-	herdrThoughtPattern = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
+	herdrThoughtPattern   = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
+	hermesBoxPattern      = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
+	hermesReasoningBox    = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
+	kimiInputBoxPattern   = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
 )
 
 // cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
-// from raw terminal screen dumps.
+// from raw terminal screen dumps across OpenCode, Kimi, and Hermes agents.
 func cleanHerdrTerminalOutput(text string) string {
+	// 0. If Hermes formatted response box is present, extract directly
+	if m := hermesBoxPattern.FindStringSubmatch(text); len(m) >= 2 && strings.TrimSpace(m[1]) != "" {
+		return strings.TrimSpace(m[1])
+	}
+
+	// Strip Hermes reasoning boxes if present
+	text = hermesReasoningBox.ReplaceAllString(text, "")
+
+	// Strip Kimi bottom input box if present
+	text = kimiInputBoxPattern.ReplaceAllString(text, "")
+
 	lines := strings.Split(text, "\n")
 	var cleanedLines []string
 
-	// 1. Strip prompt echo lines (starting with vertical line borders)
+	// 1. Strip prompt echo lines (vertical borders or Kimi prompt marker ✨)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "┃") || strings.HasPrefix(trimmed, "│") || strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "✨ ") || strings.HasPrefix(trimmed, "● respond in one sentence") {
 			continue
 		}
 		cleanedLines = append(cleanedLines, line)

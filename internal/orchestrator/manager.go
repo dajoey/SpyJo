@@ -796,7 +796,16 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// Terminal provider completion remains visible as awaiting_transition
 			// until reconciliation observes the agent-authored durable file move.
 		}
-		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+		targetModel := m.resolveTargetModel(route, lease)
+		var threadID string
+		var steered bool
+		if ms, ok := m.Harness.(interface {
+			SendWithModel(context.Context, string, string, string, core.Emit) (string, bool, error)
+		}); ok && targetModel != "" {
+			threadID, steered, err = ms.SendWithModel(ctx, lease.SessionKey, prompt, targetModel, emit)
+		} else {
+			threadID, steered, err = m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+		}
 		lifecycleMu.Lock()
 		defer lifecycleMu.Unlock()
 		if err != nil {
@@ -1552,6 +1561,37 @@ func (m *Manager) agentPrefix(phase string, settings config.Harness) string {
 	default:
 		return settings.DeveloperAgentPrefix
 	}
+}
+
+func (m *Manager) resolveTargetModel(route workflowRoute, lease Lease) string {
+	harnessSettings := m.harnessSettings()
+	phase := normalizeLeasePhase(route.Name, lease.Phase)
+
+	// 1. If this is a review phase, default to reviewer model
+	if phase == phaseTaskReview || phase == phaseGoalReview || phase == "review" {
+		if harnessSettings.ReviewerModel != "" {
+			return harnessSettings.ReviewerModel
+		}
+		return "kimi"
+	}
+
+	// 2. Check frontmatter of the claimed task / goal file
+	if doc, err := ReadDocument(lease.File); err == nil {
+		if agent, ok := doc.FrontMatter["agent"].(string); ok && strings.TrimSpace(agent) != "" {
+			return strings.TrimSpace(agent)
+		}
+		if model, ok := doc.FrontMatter["model"].(string); ok && strings.TrimSpace(model) != "" {
+			return strings.TrimSpace(model)
+		}
+	}
+
+	// 3. Fallback to developer model
+	if harnessSettings.DeveloperModel != "" {
+		return harnessSettings.DeveloperModel
+	}
+
+	// 4. Default harness model
+	return harnessSettings.Model
 }
 
 func phaseForFile(routeName, file string) string {

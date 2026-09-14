@@ -58,6 +58,8 @@ type Workspace struct {
 type Harness struct {
 	Name                   string   `yaml:"name"`
 	Model                  string   `yaml:"model,omitempty"`
+	DeveloperModel         string   `yaml:"developer_model,omitempty"`
+	ReviewerModel          string   `yaml:"reviewer_model,omitempty"`
 	ReasoningEffort        string   `yaml:"reasoning_effort"`
 	ServiceMode            string   `yaml:"service_mode"`
 	Sandbox                string   `yaml:"sandbox"`
@@ -409,6 +411,8 @@ func (c Config) Validate() error {
 		{name: "developer_agent_prefix", value: c.Harness.DeveloperAgentPrefix},
 		{name: "reviewer_agent_prefix", value: c.Harness.ReviewerAgentPrefix},
 		{name: "heartbeat_agent_prefix", value: c.Harness.HeartbeatAgentPrefix},
+		{name: "developer_model", value: c.Harness.DeveloperModel},
+		{name: "reviewer_model", value: c.Harness.ReviewerModel},
 	} {
 		invalidControl := strings.IndexFunc(field.value, unicode.IsControl) >= 0
 		if len(field.value) > 256 || invalidControl {

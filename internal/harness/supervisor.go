@@ -284,13 +284,26 @@ func (s *Supervisor) targetLocked() (Harness, error) {
 }
 
 func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
-	return s.send(ctx, key, prompt, "", emit)
+	return s.send(ctx, key, prompt, "", "", emit)
+}
+
+func (s *Supervisor) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	return s.send(ctx, key, prompt, "", model, emit)
+}
+
+func (s *Supervisor) SetModel(model string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.Model = model
+	if target, ok := s.current.(ModelDispatcher); ok {
+		target.SetModel(model)
+	}
 }
 
 // SendConversation gives the supervisor the raw user message needed for
 // lossless batching. When no queue forms it is identical to Send.
 func (s *Supervisor) SendConversation(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
-	return s.send(ctx, key, prompt, message, emit)
+	return s.send(ctx, key, prompt, message, "", emit)
 }
 
 // ConversationAdmission reports the provider-neutral follow-up mode visible
@@ -309,7 +322,7 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 	return "steered"
 }
 
-func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
+func (s *Supervisor) send(ctx context.Context, key, prompt, message, modelOverride string, emit core.Emit) (string, bool, error) {
 	operation := s.controlOperation(key)
 	operation.Lock()
 	// Selecting the target and marking a new turn active must be atomic with
@@ -323,7 +336,11 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		return "", false, err
 	}
 	wasActive := target.IsActive(key)
-	selection := inferenceSelection(s.config)
+	cfg := s.config
+	if modelOverride != "" {
+		cfg.Model = modelOverride
+	}
+	selection := inferenceSelection(cfg)
 	logicalActive := s.active[key] > 0
 	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
@@ -348,7 +365,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 			// as the next ordinary turn instead of losing the follow-up.
 			if !target.IsActive(key) {
 				operation.Unlock()
-				return s.send(ctx, key, prompt, message, emit)
+				return s.send(ctx, key, prompt, message, modelOverride, emit)
 			}
 			operation.Unlock()
 			return threadID, steered, err
