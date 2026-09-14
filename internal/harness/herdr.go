@@ -295,6 +295,8 @@ func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (ta
 			threadID = getResp.Result.Agent.AgentSession.Value
 		}
 	}
+	// Brief settle pause to let agent terminal finish initialization and input binding
+	time.Sleep(1500 * time.Millisecond)
 
 	return expectedWorkerName, newPaneID, true, threadID, nil
 }
@@ -380,6 +382,14 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	promptCmd := exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
 	turn.cmd = promptCmd
 	promptOut, promptErr := promptCmd.CombinedOutput()
+
+	// If prompt stalled due to agent input loop not ready, retry once after a short delay
+	if promptErr != nil && strings.Contains(string(promptOut), "agent_prompt_stalled") {
+		time.Sleep(2000 * time.Millisecond)
+		promptCmd = exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
+		turn.cmd = promptCmd
+		promptOut, promptErr = promptCmd.CombinedOutput()
+	}
 
 	close(streamDone)
 
@@ -485,12 +495,15 @@ var (
 		regexp.MustCompile(`(?m)^\s*context:\s*\d+%.*$`),
 		regexp.MustCompile(`(?m)^\s*⚕\s+k\d+.*$`),
 		regexp.MustCompile(`(?m)^\s*❯\s+Ask anything.*$`),
+		regexp.MustCompile(`(?m)^.*Message (?:Antigravity|agy|SpyJo).*$`),
+		regexp.MustCompile(`(?m)^\s*▄▄[↵\^].*$`),
 		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
 	}
 	herdrThoughtPattern   = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
 	hermesBoxPattern      = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
 	hermesReasoningBox    = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
 	kimiInputBoxPattern   = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
+	agyInputBoxPattern    = regexp.MustCompile(`(?s)╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯`)
 )
 
 // cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
@@ -506,6 +519,9 @@ func cleanHerdrTerminalOutput(text string) string {
 
 	// Strip Kimi bottom input box if present
 	text = kimiInputBoxPattern.ReplaceAllString(text, "")
+
+	// Strip Antigravity / SpyJo bottom input box if present
+	text = agyInputBoxPattern.ReplaceAllString(text, "")
 
 	lines := strings.Split(text, "\n")
 	var cleanedLines []string
