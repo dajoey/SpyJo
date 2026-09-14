@@ -1408,7 +1408,7 @@ func TestHelpRoutesToBriefIndexAndFocusedTopics(t *testing.T) {
 	}
 
 	tests := map[string]string{
-		"/help about":      "# About Spynel",
+		"/help about":      "# About SpyJo",
 		"/help commands":   "/stop",
 		"/help extensions": "/extension install",
 		"/help config":     ".spynel/config.yaml",
@@ -1734,9 +1734,9 @@ func TestTelegramStartRepliesWithoutRegisteringACommand(t *testing.T) {
 	service := New(cfg, target)
 	t.Cleanup(func() { _ = service.Close() })
 	for _, test := range []struct{ channel, text, want string }{
-		{"telegram", "/start", "Spynel is running."},
-		{"telegram", "/start@spynel_bot", "Spynel is running."},
-		{"telegram", "/start payload", "Spynel is running."},
+		{"telegram", "/start", "SpyJo is running."},
+		{"telegram", "/start@spynel_bot", "SpyJo is running."},
+		{"telegram", "/start payload", "SpyJo is running."},
 		{"tui", "/start", "Unknown command /start. Use /help."},
 		{"cli", "/start", "Unknown command /start. Use /help."},
 		{"whatsapp", "/start", "Unknown command /start. Use /help."},
@@ -2029,7 +2029,7 @@ func TestRestartCommandAcknowledgesAndRequestsProcessRestartAcrossChannels(t *te
 	target := newServiceHarness()
 	service := New(cfg, target)
 
-	const acknowledgment = "Restarting Spynel..."
+	const acknowledgment = "Restarting SpyJo..."
 	for _, channelName := range []string{"tui", "telegram", "whatsapp", "cli"} {
 		var response core.Event
 		message := core.Message{Channel: channelName, Conversation: "restart-" + channelName, Text: "/restart"}
@@ -3833,7 +3833,7 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 	if err != nil || first == nil || first.ID != "welcome" || first.Banner != core.SpynelASCII || len(first.Controls) != 0 || !first.Markdown {
 		t.Fatalf("first welcome = %#v, %v", first, err)
 	}
-	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "I handle tasks and orchestrate agents", "leave the rest to me", "ask me for updates anytime", "have me get things done", "👍", "- type `/help` if you ever feel lost", "- type `/config` for configuration", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
+	for _, want := range []string{"👋 Hey, I'm **SpyJo**", "call me **Spy**", "I handle tasks and orchestrate agents", "leave the rest to me", "ask me for updates anytime", "have me get things done", "👍", "- type `/help` if you ever feel lost", "- type `/config` for configuration", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
 		if !strings.Contains(first.Subtitle, want) {
 			t.Fatalf("welcome message is missing %q: %q", want, first.Subtitle)
 		}
@@ -3853,7 +3853,7 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Screen != nil || !strings.HasPrefix(response.Text, core.SpynelLogoMarkdown) || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Count(response.Text, "- type `/config` for configuration") != 1 || !strings.Contains(response.Text, "- type `/help` if you ever feel lost\n- type `/config` for configuration") || strings.Contains(response.Text, "`/telegram`") || !strings.Contains(response.Text, "`/whatsapp`") {
+	if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Screen != nil || !strings.HasPrefix(response.Text, core.SpynelLogoMarkdown) || !strings.Contains(response.Text, "**SpyJo**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Count(response.Text, "- type `/config` for configuration") != 1 || !strings.Contains(response.Text, "- type `/help` if you ever feel lost\n- type `/config` for configuration") || strings.Contains(response.Text, "`/telegram`") || !strings.Contains(response.Text, "`/whatsapp`") {
 		t.Fatalf("manual TUI welcome = %#v", response)
 	}
 	recent, _, err := service.History.Recent("tui", "local", 100000)
@@ -3865,7 +3865,7 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 		if err := service.Handle(context.Background(), core.Message{Channel: channelName, Conversation: "remote", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
 			t.Fatal(err)
 		}
-		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/config`") || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
+		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**SpyJo**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/config`") || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
 			t.Fatalf("%s welcome = %#v", channelName, response)
 		}
 	}

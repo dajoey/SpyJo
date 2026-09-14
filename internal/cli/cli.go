@@ -123,7 +123,7 @@ func run(args []string, version string) error {
 		return runUninstallBundles(args[1:])
 	case "killall":
 		if len(args) != 1 {
-			return errors.New("usage: spynel killall")
+			return errors.New("usage: spyjo killall")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
@@ -155,25 +155,25 @@ func run(args []string, version string) error {
 			return nil
 		})
 		if err == nil {
-			fmt.Printf("Stopped %d Spynel instance(s).\n", count)
+			fmt.Printf("Stopped %d SpyJo instance(s).\n", count)
 		}
 		return err
 	case "update":
 		return runUpdateCommand(args[1:], version)
 	case "check-restartable":
 		if len(args) != 1 {
-			return errors.New("usage: spynel check-restartable")
+			return errors.New("usage: spyjo check-restartable")
 		}
 		return updater.Detect(version).CheckRestartable()
 	case "restart-instances":
 		if len(args) != 1 {
-			return errors.New("usage: spynel restart-instances")
+			return errors.New("usage: spyjo restart-instances")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 		defer cancel()
 		count, err := updater.Detect(version).RestartInstances(ctx, version)
 		if err == nil {
-			fmt.Fprintf(os.Stderr, "Restarted %d other Spynel instance(s).\n", count)
+			fmt.Fprintf(os.Stderr, "Restarted %d other SpyJo instance(s).\n", count)
 		}
 		return err
 	case "docs":
@@ -187,12 +187,12 @@ func run(args []string, version string) error {
 			return err
 		}
 		if flags.NArg() != 0 {
-			return errors.New("usage: spynel version [--quiet]")
+			return errors.New("usage: spyjo version [--quiet]")
 		}
 		if *quiet {
 			return nil
 		}
-		fmt.Println("spynel " + version)
+		fmt.Println("spyjo " + version)
 		return nil
 	case "init":
 		flags := flag.NewFlagSet("init", flag.ContinueOnError)
@@ -252,7 +252,7 @@ func run(args []string, version string) error {
 	case "task", "todo", "goal":
 		if len(args) >= 2 && args[0] != "goal" && args[1] == "inspect" {
 			if len(args) != 3 {
-				return errors.New("usage: spynel task inspect FILE")
+				return errors.New("usage: spyjo task inspect FILE")
 			}
 			return inspectTaskPolicy(args[2], os.Stdout)
 		}
@@ -263,7 +263,7 @@ func run(args []string, version string) error {
 			requestArgs = requestArgs[1:]
 		}
 		if len(requestArgs) == 0 {
-			return fmt.Errorf("usage: spynel %s [--no-review] <request>", args[0])
+			return fmt.Errorf("usage: spyjo %s [--no-review] <request>", args[0])
 		}
 		cfg, err := config.Load("")
 		if err != nil {
@@ -464,7 +464,7 @@ func runInstructionsCommand(args []string, output io.Writer) error {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: spynel instructions [--config PATH]")
+		return errors.New("usage: spyjo instructions [--config PATH]")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -1258,7 +1258,7 @@ func extensionCommand(args []string) error {
 	switch args[0] {
 	case "install":
 		if len(args) < 2 || len(args) > 3 {
-			return errors.New("usage: spynel extension install <git-url> [name]")
+			return errors.New("usage: spyjo extension install <git-url> [name]")
 		}
 		name := ""
 		if len(args) == 3 {
@@ -1276,7 +1276,7 @@ func extensionCommand(args []string) error {
 		return nil
 	case "remove":
 		if len(args) != 2 {
-			return errors.New("usage: spynel extension remove <name>")
+			return errors.New("usage: spyjo extension remove <name>")
 		}
 		if err := extensions.Remove(directory, args[1]); err != nil {
 			return err
@@ -1284,7 +1284,7 @@ func extensionCommand(args []string) error {
 		fmt.Printf("Removed %s; reinstall its Git repository to recover it.\n", args[1])
 		return nil
 	default:
-		return errors.New("usage: spynel extension [list|install <git-url> [name]|remove <name>]")
+		return errors.New("usage: spyjo extension [list|install <git-url> [name]|remove <name>]")
 	}
 }
 
@@ -1340,36 +1340,36 @@ func enabled(value bool) string {
 	return "disabled"
 }
 
-const helpText = `Spynel - non-AI orchestration for one human and many coding agents
+const helpText = `SpyJo - non-AI orchestration for one human and many coding agents
 
 Usage:
-  spynel                         Launch TUI and enabled background services
-  spynel serve [--tui] [--socket PATH]
+  spyjo                         Launch TUI and enabled background services
+  spyjo serve [--tui] [--socket PATH]
                                 Run channels and orchestration; mirror safe lifecycle logs when headless
-  spynel init [--dir DIR]        Initialize and continue into the TUI
-    --no-start                   Initialize only (for scripts and automation)
-  spynel send [flags] TEXT       Send or stream a message
-    --config PATH                Load an explicit workspace configuration
-    --conversation NAME          Reuse a durable CLI conversation (default local)
-    --stream                     Print response deltas as they arrive
-    --json                       Emit every response event as NDJSON
-    --stdin                      Read the message body from standard input
-    --attach PATH                Copy and attach a file (repeatable)
-    --request-id ID              Retain request identity across a deliberate retry
-    --socket PATH                Use an explicit private Unix socket
-  spynel events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]
+  spyjo init [--dir DIR]        Initialize and continue into the TUI
+    --no-start                  Initialize only (for scripts and automation)
+  spyjo send [flags] TEXT       Send or stream a message
+    --config PATH               Load an explicit workspace configuration
+    --conversation NAME         Reuse a durable CLI conversation (default local)
+    --stream                    Print response deltas as they arrive
+    --json                      Emit every response event as NDJSON
+    --stdin                     Read the message body from standard input
+    --attach PATH               Copy and attach a file (repeatable)
+    --request-id ID             Retain request identity across a deliberate retry
+    --socket PATH               Use an explicit private Unix socket
+  spyjo events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]
                                 Subscribe to committed replies and later notifications
-  spynel followup [flags] TEXT   Steer an active server-side CLI conversation
-  spynel notify --workdir PATH (--origin O | --recent-authorized) --message TEXT
+  spyjo followup [flags] TEXT   Steer an active server-side CLI conversation
+  spyjo notify --workdir PATH (--origin O | --recent-authorized) --message TEXT
                                 Queue a proactive assistant notification
-  spynel conversations list     List disk-backed conversations
-  spynel conversations show     Read a bounded conversation tail
-  spynel conversations resume   Branch any saved conversation into CLI
-  spynel status [flags]          Show workspace and current conversation status
-  spynel command [flags] NAME    Run any non-visual framework slash command
-  spynel model|effort|speed ... Inspect or select model inference properties
-  spynel tasks [flags] [VIEW]   List durable tasks (open by default)
-  spynel goals [flags] [VIEW]   List durable goals (open by default)
+  spyjo conversations list      List disk-backed conversations
+  spyjo conversations show      Read a bounded conversation tail
+  spyjo conversations resume    Branch any saved conversation into CLI
+  spyjo status [flags]          Show workspace and current conversation status
+  spyjo command [flags] NAME    Run any non-visual framework slash command
+  spyjo model|effort|speed ...  Inspect or select model inference properties
+  spyjo tasks [flags] [VIEW]    List durable tasks (open by default)
+  spyjo goals [flags] [VIEW]    List durable goals (open by default)
     VIEW                        open|recent|active|review|waiting|done|failed|all
     --config PATH               Load an explicit workspace configuration
     --conversation NAME         Use a durable CLI command conversation
@@ -1377,26 +1377,26 @@ Usage:
     --limit N                   Render 1 through 100 matching items
     --detail                    Add allowlisted durable details
     --json                      Emit the shared response event as NDJSON
-  spynel job message N TEXT     Guide a live orchestrator job in place
-  spynel job ping N             Request durable progress from a live job
-  spynel docs [TOPIC]            Read curated offline documentation
-    search QUERY [page NUMBER]   Search bounded topic sections
-    --format text|json           Select plain Markdown or versioned JSON
-  spynel instructions            Validate role instruction files without showing contents
-  spynel jobs|log...             Other concise framework-command aliases
-  spynel update                 Update and restart every instance of this installation
-  spynel update check           Check versions without updating or restarting
-  spynel killall                Stop all running Spynel instances
-  spynel run --once              Dispatch one orchestration scan and wait
-  spynel task [--no-review] REQUEST
+  spyjo job message N TEXT      Guide a live orchestrator job in place
+  spyjo job ping N              Request durable progress from a live job
+  spyjo docs [TOPIC]            Read curated offline documentation
+    search QUERY [page NUMBER]  Search bounded topic sections
+    --format text|json          Select plain Markdown or versioned JSON
+  spyjo instructions            Validate role instruction files without showing contents
+  spyjo jobs|log...             Other concise framework-command aliases
+  spyjo update                  Update and restart every instance of this installation
+  spyjo update check            Check versions without updating or restarting
+  spyjo killall                 Stop all running SpyJo instances
+  spyjo run --once              Dispatch one orchestration scan and wait
+  spyjo task [--no-review] REQUEST
                                 Create a task (reviewed by default)
-  spynel task inspect FILE      Show the task's effective review policy
-  spynel goal OBJECTIVE          Create a goal markdown file
-  spynel extension ...           List, install, or remove Git extensions
-  spynel whatsapp pair           Pair a WhatsApp account by QR code
-  spynel config [get|set ...]    Validate config or run the shared config command
-  spynel doctor                  Check local configuration and prerequisites
-  spynel version                 Print the binary version
+  spyjo task inspect FILE       Show the task's effective review policy
+  spyjo goal OBJECTIVE          Create a goal markdown file
+  spyjo extension ...           List, install, or remove Git extensions
+  spyjo whatsapp pair           Pair a WhatsApp account by QR code
+  spyjo config [get|set ...]    Validate config or run the shared config command
+  spyjo doctor                  Check local configuration and prerequisites
+  spyjo version                 Print the binary version
 `
 
 // runInstallBundle is a workspace-independent entry point used by install.sh.

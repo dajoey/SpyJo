@@ -80,14 +80,14 @@ func (s *Service) channelNeedsSetup(section string) bool {
 
 func (s *Service) WelcomeScreen() core.Screen {
 	return core.Screen{
-		ID: "welcome", Title: "Welcome to Spynel", Banner: core.SpynelASCII,
+		ID: "welcome", Title: "Welcome to SpyJo", Banner: core.SpynelASCII,
 		Subtitle: s.welcomeText("tui"), Markdown: true,
 	}
 }
 
 func (s *Service) welcomeText(channelName string) string {
 	lines := []string{
-		"👋 Hey, I'm **Spynel** — you can call me **Spy**.", "",
+		"👋 Hey, I'm **SpyJo** — you can call me **Spy**.", "",
 		"I handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.",
 		"Feel free to ask me for updates anytime or have me get things done. 👍",
 		"", "- type `/help` if you ever feel lost",
@@ -1529,7 +1529,7 @@ func (s *Service) resolveHarnessCommand(name string) (string, error) {
 }
 
 func formatSettings(cfg config.Config, section string) string {
-	title := "Spynel configuration"
+	title := "SpyJo configuration"
 	if section == "telegram" {
 		title = "Telegram configuration"
 	} else if section == "whatsapp" {

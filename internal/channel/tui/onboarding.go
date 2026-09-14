@@ -29,8 +29,8 @@ const (
 // screens, but is required because chat cannot start without a workspace.
 func InitializationScreen(root string) core.Screen {
 	return core.Screen{
-		ID: "initialize", Title: "Welcome to Spynel", Banner: core.SpynelASCII,
-		Subtitle: fmt.Sprintf("Spynel is not configured in this directory:\n%s\n\nWould you like to initialize it here?", root),
+		ID: "initialize", Title: "Welcome to SpyJo", Banner: core.SpynelASCII,
+		Subtitle: fmt.Sprintf("SpyJo is not configured in this directory:\n%s\n\nWould you like to initialize it here?", root),
 		Required: true, ExitOnAction: true,
 		Hints: []core.ScreenHint{
 			{Key: "↑↓/⇥", Action: "nav"},
@@ -38,7 +38,7 @@ func InitializationScreen(root string) core.Screen {
 			{Key: "␛", Action: "exit"},
 		},
 		Controls: []core.ScreenControl{
-			{Key: "initialize", Kind: "action", Value: "Initialize Spynel in " + root, Description: "Create the private .spynel workspace and its config.yaml"},
+			{Key: "initialize", Kind: "action", Value: "Initialize SpyJo in " + root, Description: "Create the private .spynel workspace and its config.yaml"},
 			{Key: "exit", Kind: "action", Value: "Exit", Description: "Leave this directory unchanged"},
 		},
 	}
@@ -48,8 +48,8 @@ func InitializationScreen(root string) core.Screen {
 // proceed with ordinary ancestor discovery.
 func ParentWorkspaceScreen(launchRoot, parentRoot string) core.Screen {
 	return core.Screen{
-		ID: "workspace-choice", Title: "Choose a Spynel workspace", Banner: core.SpynelASCII,
-		Subtitle: fmt.Sprintf("This folder is not initialized:\n%s\n\nSpynel found an initialized parent workspace:\n%s\n\nChoose where this interactive session should run.", launchRoot, parentRoot),
+		ID: "workspace-choice", Title: "Choose a SpyJo workspace", Banner: core.SpynelASCII,
+		Subtitle: fmt.Sprintf("This folder is not initialized:\n%s\n\nSpyJo found an initialized parent workspace:\n%s\n\nChoose where this interactive session should run.", launchRoot, parentRoot),
 		Required: true, ExitOnAction: true,
 		Hints: []core.ScreenHint{
 			{Key: "↑↓/⇥", Action: "nav"},
@@ -149,7 +149,7 @@ func newRequiredActionModel(ctx context.Context, screen core.Screen, callback fu
 	input.SetHeight(maxComposerHeight)
 	input.SetWidth(80)
 	m := model{
-		ctx: ctx, title: "Spynel", input: input, inputWidth: 80,
+		ctx: ctx, title: "SpyJo", input: input, inputWidth: 80,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 1), composerRows: minComposerHeight,
 		logoSpinner: newLogoSpinner(), workingSpinner: newWorkingSpinner(), connection: map[string]channel.ConnectionStatus{},
 		themes: []theme.Theme{activeTheme}, activeTheme: activeTheme, styles: styles,

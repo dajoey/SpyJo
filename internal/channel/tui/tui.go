@@ -347,7 +347,7 @@ const (
 const transcriptOmitted = "Older messages are omitted from the live display; use /history for the complete conversation file."
 
 const (
-	composerPlaceholder = "Message Spynel, / for commands"
+	composerPlaceholder = "Message SpyJo, / for commands"
 	emptyConversation   = "A fresh start."
 )
 

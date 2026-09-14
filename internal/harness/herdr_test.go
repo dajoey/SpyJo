@@ -79,3 +79,32 @@ func TestHerdrInBuiltinRegistry(t *testing.T) {
 		t.Fatalf("expected *Herdr, got %T", h)
 	}
 }
+
+func TestCleanHerdrTerminalOutput(t *testing.T) {
+	raw := `  ┃  <!-- Add concise, lasting workspace-specific behavior for the communication agent below. -->
+  ┃  </workspace_owner_persistent_instructions>
+  ┃
+  ┃  End of persistent instructions for the chat agent. The precedence stated above still applies to every imported rule.
+  ┃
+
+     Thought: 7.3s
+
+     Acknowledging no available tools and explaining inability to inspect files while noting no prior durable work.
+
+     Fresh start: nothing has been dispatched in this conversation yet, so there’s nothing to report. What would you like to work on first?
+
+     ▣  Build · Muse Spark 1.3 Contributor · 10.1s
+
+  ┃
+  ┃
+  ┃
+  ┃  Build · Muse Spark 1.3 Contributor OpenCode Go · high                                                                                                                                                         ~/aibs/opencode
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   /home/dajoey/aibs/opencode                                                                                                                                             214.9K (20%) · $0.26  ctrl+p commands    • OpenCode 1.18.30`
+
+	got := cleanHerdrTerminalOutput(raw)
+	want := "Fresh start: nothing has been dispatched in this conversation yet, so there’s nothing to report. What would you like to work on first?"
+	if got != want {
+		t.Fatalf("cleanHerdrTerminalOutput = %q, want %q", got, want)
+	}
+}

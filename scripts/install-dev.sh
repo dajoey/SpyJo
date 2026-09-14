@@ -56,7 +56,8 @@ esac
 
 mkdir -p "$bin_dir"
 bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd)
-target="$bin_dir/spynel"
+target="$bin_dir/spyjo"
+alias_target="$bin_dir/spynel"
 if [ -e "$target" ] && [ ! -f "$target" ] && [ ! -L "$target" ]; then
   echo "refusing to replace non-file target: $target" >&2
   exit 1
@@ -67,7 +68,7 @@ if [ ! -x "$built_binary" ]; then
   echo "development build did not produce an executable: $built_binary" >&2
   exit 1
 fi
-staged=$(mktemp "$bin_dir/.spynel.dev.XXXXXX")
+staged=$(mktemp "$bin_dir/.spyjo.dev.XXXXXX")
 cleanup() {
   if [ -e "$staged" ]; then
     unlink "$staged"
@@ -77,6 +78,7 @@ trap cleanup EXIT HUP INT TERM
 cp "$built_binary" "$staged"
 chmod 0755 "$staged"
 mv -f "$staged" "$target"
+ln -sf "$target" "$alias_target"
 trap - EXIT HUP INT TERM
 
 path_contains() {
@@ -92,7 +94,7 @@ path_contains() {
   return 1
 }
 
-echo "Installed development build: $target"
+echo "Installed development build: $target (and linked $alias_target)"
 if ! path_contains "$bin_dir"; then
   cat <<EOF
 
@@ -105,14 +107,14 @@ EOF
   exit 0
 fi
 
-resolved=$(command -v spynel || true)
+resolved=$(command -v spyjo || true)
 if [ "$resolved" != "$target" ]; then
   cat <<EOF
 
-Warning: PATH currently resolves spynel to ${resolved:-another location} before $target.
+Warning: PATH currently resolves spyjo to ${resolved:-another location} before $target.
 Move $bin_dir earlier in PATH to run this development build by name.
 EOF
   exit 0
 fi
 
-echo "Ready: run 'spynel' from this or any other terminal."
+echo "Ready: run 'spyjo' from this or any other terminal."

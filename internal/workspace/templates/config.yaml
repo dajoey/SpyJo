@@ -25,11 +25,11 @@ harness:
 
 channels:
   tui:
-    title: Spynel
+    title: SpyJo
     theme: spynel
   telegram:
     enabled: false
-    name: spynel
+    name: spyjo
     token_env: SPYNEL_TELEGRAM_TOKEN
     mode: polling
     webhook_url: ""

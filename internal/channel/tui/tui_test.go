@@ -107,7 +107,7 @@ func TestApplyThemeRebindsRenderedComposerPlaceholder(t *testing.T) {
 
 func TestFreshConversationUsesConciseCopy(t *testing.T) {
 	m := testModel()
-	if m.input.Placeholder != "Message Spynel, / for commands" {
+	if m.input.Placeholder != "Message SpyJo, / for commands" {
 		t.Fatalf("composer placeholder = %q", m.input.Placeholder)
 	}
 	m.renderHistory()
@@ -4064,7 +4064,7 @@ func TestRequiredInitializationScreenActionsAndCannotFallIntoChat(t *testing.T) 
 	screen := InitializationScreen("/workspace/new")
 	m.openScreen(screen)
 	view := ansi.Strip(m.View())
-	if !strings.Contains(screen.Subtitle, "not configured") || !strings.Contains(view, "/workspace/new") || !strings.Contains(screen.Controls[0].Value, "Initialize Spynel") {
+	if !strings.Contains(screen.Subtitle, "not configured") || !strings.Contains(view, "/workspace/new") || !strings.Contains(screen.Controls[0].Value, "Initialize SpyJo") {
 		t.Fatalf("initialization screen is incomplete: %q", view)
 	}
 
@@ -4167,7 +4167,7 @@ func TestInitializationOptionBlocksHaveOneSemanticSeparatorRow(t *testing.T) {
 
 	initializeRow := -1
 	for index, row := range plainRows {
-		if strings.Contains(row, "Initialize Spynel in /workspace/fresh-project") {
+		if strings.Contains(row, "Initialize SpyJo in /workspace/fresh-project") {
 			initializeRow = index
 			break
 		}

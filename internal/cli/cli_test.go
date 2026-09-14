@@ -394,8 +394,8 @@ func TestWorkflowListAliasPreservesSharedAndListOptions(t *testing.T) {
 
 func TestWorkflowListAliasesAreDocumentedForExternalPrograms(t *testing.T) {
 	for _, want := range []string{
-		"spynel tasks [flags] [VIEW]",
-		"spynel goals [flags] [VIEW]",
+		"spyjo tasks [flags] [VIEW]",
+		"spyjo goals [flags] [VIEW]",
 		"open|recent|active|review|waiting|done|failed|all",
 		"--config PATH",
 		"--conversation NAME",
@@ -826,13 +826,13 @@ func TestInitNoStartCreatesWorkspaceWithoutEnteringTUI(t *testing.T) {
 }
 
 func TestSendCommandValidatesScriptableArguments(t *testing.T) {
-	if err := run([]string{"send"}, "test"); err == nil || !strings.Contains(err.Error(), "usage: spynel send") {
+	if err := run([]string{"send"}, "test"); err == nil || !strings.Contains(err.Error(), "usage: spyjo send") {
 		t.Fatalf("missing send text error = %v", err)
 	}
 	if err := run([]string{"send", "--conversation", "", "hello"}, "test"); err == nil || !strings.Contains(err.Error(), "cannot be empty") {
 		t.Fatalf("empty conversation error = %v", err)
 	}
-	if !strings.Contains(helpText, "spynel send") || !strings.Contains(helpText, "--conversation") {
+	if !strings.Contains(helpText, "spyjo send") || !strings.Contains(helpText, "--conversation") {
 		t.Fatalf("send command is not documented in CLI help:\n%s", helpText)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -314,15 +315,12 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		close(turn.done)
 	}()
 
-	// Capture initial baseline output
-	initOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "100").Output()
-	lastSeen := string(initOut)
-
-	// Background streaming ticker
-	streamTicker := time.NewTicker(1500 * time.Millisecond)
+	// Background status ticker while agent is processing prompt
+	streamTicker := time.NewTicker(2 * time.Second)
 	streamDone := make(chan struct{})
 	go func() {
 		defer streamTicker.Stop()
+		startTime := time.Now()
 		for {
 			select {
 			case <-streamDone:
@@ -330,16 +328,12 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 			case <-turnContext.Done():
 				return
 			case <-streamTicker.C:
-				readOut, rErr := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "100").Output()
-				if rErr == nil {
-					curr := string(readOut)
-					if len(curr) > len(lastSeen) && strings.HasPrefix(curr, lastSeen[:min(len(lastSeen), 200)]) {
-						delta := curr[len(lastSeen):]
-						lastSeen = curr
-						if emit != nil && strings.TrimSpace(delta) != "" {
-							emit(core.Event{Kind: core.EventDelta, Text: delta})
-						}
-					}
+				elapsed := time.Since(startTime).Truncate(time.Second)
+				if emit != nil {
+					emit(core.Event{
+						Kind: core.EventStatus,
+						Text: fmt.Sprintf("Herdr: %s working (%s)...", target, elapsed),
+					})
 				}
 			}
 		}
@@ -353,21 +347,16 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 
 	close(streamDone)
 
-	// Fetch final terminal output
-	finalOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "250").Output()
-	finalText := strings.TrimSpace(string(finalOut))
-	if finalText == "" {
-		finalText = strings.TrimSpace(string(promptOut))
-	}
-
 	// Inspect final agent state
 	getCmd := exec.Command(h.config.Command, "agent", "get", target)
 	getOut, getErr := getCmd.Output()
 	var agentStatus string
+	var agentKind string
 	if getErr == nil {
 		var getResp herdrAgentGetResponse
 		if json.Unmarshal(getOut, &getResp) == nil {
 			agentStatus = getResp.Result.Agent.AgentStatus
+			agentKind = getResp.Result.Agent.Agent
 			if getResp.Result.Agent.AgentSession.Value != "" {
 				threadID = getResp.Result.Agent.AgentSession.Value
 			}
@@ -378,6 +367,26 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		threadID = fmt.Sprintf("herdr:%s:%d", target, time.Now().Unix())
 	}
 	h.rememberSession(key, threadID)
+
+	// Fetch and clean final response text
+	var finalText string
+	if agentKind == "opencode" || strings.HasPrefix(threadID, "ses_") {
+		if text, err := extractOpencodeMessage(threadID); err == nil && strings.TrimSpace(text) != "" {
+			finalText = text
+		}
+	}
+
+	if finalText == "" {
+		finalOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "250").Output()
+		raw := strings.TrimSpace(string(finalOut))
+		if raw == "" {
+			raw = strings.TrimSpace(string(promptOut))
+		}
+		finalText = cleanHerdrTerminalOutput(raw)
+		if finalText == "" {
+			finalText = raw
+		}
+	}
 
 	// Evaluate completion
 	if promptErr != nil {
@@ -420,6 +429,95 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	}
 
 	return threadID, false, nil
+}
+
+var (
+	herdrFooterPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?m)^\s*▣\s+Build.*$`),
+		regexp.MustCompile(`(?m)^\s*╹[▀─=]+.*$`),
+		regexp.MustCompile(`(?m)^\s*✻\s+Churned for.*$`),
+		regexp.MustCompile(`(?m)^.*•\s+OpenCode.*$`),
+		regexp.MustCompile(`(?m)^.*ctrl\+p commands.*$`),
+		regexp.MustCompile(`(?m)^\s*●\s+Login expired.*$`),
+		regexp.MustCompile(`(?m)^\s*⏵⏵\s+bypass permissions.*$`),
+		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
+	}
+	herdrThoughtPattern = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
+)
+
+// cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
+// from raw terminal screen dumps.
+func cleanHerdrTerminalOutput(text string) string {
+	lines := strings.Split(text, "\n")
+	var cleanedLines []string
+
+	// 1. Strip prompt echo lines (starting with vertical line borders)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "┃") || strings.HasPrefix(trimmed, "│") || strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+		cleanedLines = append(cleanedLines, line)
+	}
+	text = strings.TrimSpace(strings.Join(cleanedLines, "\n"))
+
+	// 2. Cut off bottom status chrome
+	for _, pat := range herdrFooterPatterns {
+		loc := pat.FindStringIndex(text)
+		if loc != nil {
+			text = strings.TrimSpace(text[:loc[0]])
+		}
+	}
+
+	// 3. If there is a Thought block followed by an answer, extract the actual answer
+	if m := herdrThoughtPattern.FindStringSubmatch(text); m != nil && len(m) >= 3 && strings.TrimSpace(m[2]) != "" {
+		text = strings.TrimSpace(m[2])
+	}
+
+	return strings.TrimSpace(text)
+}
+
+// extractOpencodeMessage queries OpenCode's local database for the latest assistant message in a session.
+func extractOpencodeMessage(sessionID string) (string, error) {
+	if !strings.HasPrefix(sessionID, "ses_") {
+		return "", errors.New("not an opencode session")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dbPath := filepath.Join(home, ".local", "share", "opencode", "opencode.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return "", err
+	}
+
+	// 1. Find the latest assistant message ID for this session
+	msgCmd := exec.Command("sqlite3", fmt.Sprintf("file:%s?mode=ro", dbPath),
+		fmt.Sprintf("SELECT m.id FROM message m WHERE m.session_id = '%s' AND json_extract(m.data, '$.role') = 'assistant' ORDER BY m.time_created DESC LIMIT 1;", sessionID),
+	)
+	msgOut, err := msgCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("sqlite message query: %w", err)
+	}
+	msgID := strings.TrimSpace(string(msgOut))
+	if msgID == "" {
+		return "", errors.New("no assistant message found")
+	}
+
+	// 2. Fetch all text parts for this message in order
+	partCmd := exec.Command("sqlite3", fmt.Sprintf("file:%s?mode=ro", dbPath),
+		fmt.Sprintf("SELECT json_extract(p.data, '$.text') FROM part p WHERE p.message_id = '%s' AND json_extract(p.data, '$.type') = 'text' ORDER BY p.time_created ASC;", msgID),
+	)
+	partOut, err := partCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("sqlite part query: %w", err)
+	}
+
+	text := strings.TrimSpace(string(partOut))
+	if text == "" {
+		return "", errors.New("no text in message parts")
+	}
+	return text, nil
 }
 
 func (h *Herdr) rememberSession(key, threadID string) {

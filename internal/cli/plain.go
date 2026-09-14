@@ -80,7 +80,7 @@ func runSendCommand(name string, args []string, version string, followupOnly boo
 		text, err = cliMessageText(flags.Args(), *stdin, os.Stdin)
 	}
 	if err != nil {
-		return fmt.Errorf("usage: spynel %s [--config PATH] [--conversation NAME] [--stream|--json] [--stdin] <text>: %w", name, err)
+		return fmt.Errorf("usage: spyjo %s [--config PATH] [--conversation NAME] [--stream|--json] [--stdin] <text>: %w", name, err)
 	}
 	return runMessageMode(*configPath, *conversation, text, version, messageRunOptions{
 		RequestID: *requestID, Socket: *socket,
@@ -99,7 +99,7 @@ func runEventsCommand(args []string) error {
 		return err
 	}
 	if flags.NArg() != 0 || *socket != "" && *configPath != "" {
-		return errors.New("usage: spynel events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]")
+		return errors.New("usage: spyjo events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]")
 	}
 	if err := app.ValidateConversationName(*conversation); err != nil {
 		return err
@@ -146,7 +146,7 @@ func runNotifyCommand(args []string, version string) error {
 	})
 	text, err := notificationMessageText(flags.Args(), *stdin, messageSet, *message, os.Stdin)
 	if err != nil {
-		return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] (--origin CHANNEL/CONVERSATION|--recent-authorized) --message MESSAGE: %w", err)
+		return fmt.Errorf("usage: spyjo notify [--workdir PATH|--config PATH] (--origin CHANNEL/CONVERSATION|--recent-authorized) --message MESSAGE: %w", err)
 	}
 	if (strings.TrimSpace(*origin) == "") == !*recentAuthorized {
 		return errors.New("exactly one of --origin or --recent-authorized is required")
@@ -261,7 +261,7 @@ func runFrameworkCLICommand(command string, args []string, version string) error
 	arguments := flags.Args()
 	if command == "" {
 		if len(arguments) == 0 {
-			return errors.New("usage: spynel command [--config PATH] [--conversation NAME] [--json] <name> [arguments]")
+			return errors.New("usage: spyjo command [--config PATH] [--conversation NAME] [--json] <name> [arguments]")
 		}
 		command = arguments[0]
 		arguments = arguments[1:]
@@ -385,7 +385,7 @@ func runStatusCLICommand(args []string, version string, output io.Writer) error 
 		return err
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(*conversation) == "" {
-		return errors.New("usage: spynel status [--config PATH] [--conversation NAME] [--json]")
+		return errors.New("usage: spyjo status [--config PATH] [--conversation NAME] [--json]")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -442,7 +442,7 @@ type conversationBranch struct {
 
 func runConversationCommand(args []string, output io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: spynel conversations <list|show|resume> [options]")
+		return errors.New("usage: spyjo conversations <list|show|resume> [options]")
 	}
 	switch strings.ToLower(args[0]) {
 	case "list", "ls":
@@ -452,7 +452,7 @@ func runConversationCommand(args []string, output io.Writer) error {
 	case "resume", "branch":
 		return resumeCLIConversation(args[1:], output)
 	default:
-		return errors.New("usage: spynel conversations <list|show|resume> [options]")
+		return errors.New("usage: spyjo conversations <list|show|resume> [options]")
 	}
 }
 
@@ -465,7 +465,7 @@ func listCLIConversations(args []string, output io.Writer) error {
 		return err
 	}
 	if flags.NArg() != 0 || *limit < 1 || *limit > 1000 {
-		return errors.New("usage: spynel conversations list [--config PATH] [--limit 1..1000] [--json]")
+		return errors.New("usage: spyjo conversations list [--config PATH] [--limit 1..1000] [--json]")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -512,7 +512,7 @@ func showCLIConversation(args []string, output io.Writer) error {
 		return err
 	}
 	if flags.NArg() != 2 || *tail < 1 || *tail > maxCLIConversationTail || *characters < 1 || *characters > maxCLIConversationRunes {
-		return fmt.Errorf("usage: spynel conversations show [--config PATH] [--tail 1..%d] [--chars 1..%d] [--json] <channel> <conversation>", maxCLIConversationTail, maxCLIConversationRunes)
+		return fmt.Errorf("usage: spyjo conversations show [--config PATH] [--tail 1..%d] [--chars 1..%d] [--json] <channel> <conversation>", maxCLIConversationTail, maxCLIConversationRunes)
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -556,7 +556,7 @@ func resumeCLIConversation(args []string, output io.Writer) error {
 		return err
 	}
 	if flags.NArg() != 2 {
-		return errors.New("usage: spynel conversations resume [--config PATH] [--json] <channel> <conversation>")
+		return errors.New("usage: spyjo conversations resume [--config PATH] [--json] <channel> <conversation>")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {

@@ -29,8 +29,8 @@ if [ "$#" -gt 0 ]; then shift; fi
 case "$action" in
   build)
     mkdir -p "$project_dir/.tmp-bin"
-    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" build -o .tmp-bin/spynel ./cmd/spynel)
-    echo "$project_dir/.tmp-bin/spynel"
+    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" build -o .tmp-bin/spyjo ./cmd/spyjo && ln -sf spyjo .tmp-bin/spynel)
+    echo "$project_dir/.tmp-bin/spyjo"
     ;;
   test)
     (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... github.com/charmbracelet/bubbletea && CGO_ENABLED=1 "$go_bin" vet ./... github.com/charmbracelet/bubbletea)
