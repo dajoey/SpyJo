@@ -70,6 +70,20 @@ type herdrAgentGetResponse struct {
 	} `json:"error,omitempty"`
 }
 
+type herdrTabCreateResponse struct {
+	Result struct {
+		RootPane struct {
+			PaneID string `json:"pane_id"`
+		} `json:"root_pane"`
+		Tab struct {
+			TabID string `json:"tab_id"`
+		} `json:"tab"`
+	} `json:"result"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
 type herdrPaneSplitResponse struct {
 	Result struct {
 		Pane struct {
@@ -142,6 +156,7 @@ func (h *Herdr) Models(_ context.Context) ([]Model, error) {
 		{ID: "codex", DisplayName: "Codex", Description: "Dedicated Codex worker in Herdr pane", Efforts: allEfforts},
 		{ID: "kimi", DisplayName: "Kimi", Description: "Dedicated Kimi CLI worker in Herdr pane", Efforts: allEfforts},
 		{ID: "hermes", DisplayName: "Hermes", Description: "Dedicated Hermes worker in Herdr pane", Efforts: allEfforts},
+		{ID: "agy", DisplayName: "Antigravity", Description: "Dedicated Antigravity CLI worker in Herdr pane", Efforts: allEfforts},
 	}, nil
 }
 
@@ -211,7 +226,135 @@ func (h *Herdr) resolveCallerContext(ctx context.Context, cwd string) (string, s
 	return callerPane, workspaceID
 }
 
-func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (target string, paneID string, isDynamic bool, threadID string, err error) {
+var reLeadingDate = regexp.MustCompile(`^\d{8}(?:-\d{6})?-`)
+
+func sanitizeTag(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		} else if r == '_' || r == ':' || r == '/' || r == '.' {
+			b.WriteRune('-')
+		}
+	}
+	res := strings.Trim(b.String(), "-")
+	for strings.Contains(res, "--") {
+		res = strings.ReplaceAll(res, "--", "-")
+	}
+	return res
+}
+
+func workerNameAndLabel(key, model string) (workerName string, tabLabel string) {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "default" {
+		model = "opencode"
+	}
+
+	cleanKey := strings.TrimSpace(key)
+
+	// Background orchestrator jobs
+	if strings.HasPrefix(cleanKey, "orchestrator:") || cleanKey == "heartbeat" {
+		if cleanKey == "orchestrator:semantic-heartbeat" || cleanKey == "heartbeat" {
+			workerName = fmt.Sprintf("spyjo-heartbeat-%s-worker", model)
+			tabLabel = fmt.Sprintf("Heartbeat (%s)", model)
+			return
+		}
+
+		// Format: orchestrator:<route>:<phase>:<id>[:<attempt>]
+		parts := strings.Split(cleanKey, ":")
+		if len(parts) >= 4 {
+			phase := parts[2]
+			id := parts[3]
+			attempt := "1"
+			if len(parts) >= 5 && parts[4] != "" {
+				attempt = parts[4]
+			}
+
+			shortID := id
+			shortID = strings.TrimPrefix(shortID, "tasks-")
+			shortID = strings.TrimPrefix(shortID, "goals-")
+			shortID = reLeadingDate.ReplaceAllString(shortID, "")
+			shortID = sanitizeTag(shortID)
+			if len(shortID) > 24 {
+				shortID = shortID[:24]
+			}
+			shortID = strings.Trim(shortID, "-_")
+			if shortID == "" {
+				shortID = "job"
+			}
+
+			phasePrefix := "task"
+			phaseLabel := "Task"
+			switch {
+			case strings.Contains(phase, "impl"):
+				phasePrefix = "task"
+				phaseLabel = "Task"
+			case strings.Contains(phase, "rev"):
+				phasePrefix = "review"
+				phaseLabel = "Review"
+			case strings.Contains(phase, "plan"):
+				phasePrefix = "plan"
+				phaseLabel = "Plan"
+			default:
+				phasePrefix = "orch"
+				phaseLabel = "Task"
+			}
+
+			workerName = fmt.Sprintf("spyjo-%s-%s-%s-a%s-worker", phasePrefix, model, shortID, attempt)
+			tabLabel = fmt.Sprintf("%s: %s (%s)", phaseLabel, shortID, model)
+			return
+		}
+
+		sanitized := sanitizeTag(cleanKey)
+		if len(sanitized) > 20 {
+			sanitized = sanitized[len(sanitized)-20:]
+		}
+		workerName = fmt.Sprintf("spyjo-orch-%s-%s-worker", model, sanitized)
+		tabLabel = fmt.Sprintf("Task (%s)", model)
+		return
+	}
+
+	// Interactive chat (Front-of-House communication agent)
+	if strings.HasPrefix(cleanKey, "chat:") {
+		parts := strings.Split(cleanKey, ":")
+		channel := "tui"
+		conv := ""
+		if len(parts) >= 2 {
+			channel = parts[1]
+		}
+		if len(parts) >= 3 {
+			conv = parts[2]
+		}
+
+		shortConv := conv
+		shortConv = strings.TrimPrefix(shortConv, "local-")
+		if len(shortConv) > 8 {
+			shortConv = shortConv[:8]
+		}
+		shortConv = sanitizeTag(shortConv)
+		if shortConv == "" {
+			shortConv = "main"
+		}
+
+		workerName = fmt.Sprintf("spyjo-chat-%s-%s-%s-worker", channel, model, shortConv)
+		tabLabel = fmt.Sprintf("Chat: %s (%s)", shortConv, model)
+		return
+	}
+
+	// Generic fallback
+	sanitized := sanitizeTag(cleanKey)
+	if len(sanitized) > 16 {
+		sanitized = sanitized[:16]
+	}
+	if sanitized == "" {
+		sanitized = "worker"
+	}
+	workerName = fmt.Sprintf("spyjo-%s-%s-worker", model, sanitized)
+	tabLabel = fmt.Sprintf("SpyJo (%s)", model)
+	return
+}
+
+func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd string) (target string, paneID string, isDynamic bool, threadID string, err error) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "default" {
 		model = "opencode"
@@ -223,7 +366,7 @@ func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (ta
 	}
 
 	callerPane, workspaceID := h.resolveCallerContext(ctx, cwd)
-	expectedWorkerName := fmt.Sprintf("spyjo-%s-worker", model)
+	expectedWorkerName, tabLabel := workerNameAndLabel(key, model)
 
 	absCwd := cwd
 	if abs, err := filepath.Abs(cwd); err == nil {
@@ -252,39 +395,58 @@ func (h *Herdr) resolveTarget(ctx context.Context, model string, cwd string) (ta
 					}
 					return a.Name, a.PaneID, false, a.AgentSession.Value, nil
 				}
-
-				// If an old worker with a different model exists in this workspace, clean it up
-				if isSpyJoWorker && inWorkspace && a.Name != expectedWorkerName {
-					_ = exec.CommandContext(ctx, h.config.Command, "pane", "close", a.PaneID).Run()
-				}
 			}
 		}
 	}
 
-	// 3. Spawn a dedicated worker pane via split
-	splitArgs := []string{"pane", "split", "--direction", "right", "--ratio", "0.5", "--cwd", absCwd, "--no-focus"}
-	if callerPane != "" {
-		splitArgs = append(splitArgs, "--pane", callerPane)
+	// 3. Spawn a dedicated worker in a full-width dedicated tab
+	tabArgs := []string{"tab", "create", "--label", tabLabel, "--cwd", absCwd, "--no-focus"}
+	if workspaceID != "" {
+		tabArgs = append(tabArgs, "--workspace", workspaceID)
 	}
 
-	splitCmd := exec.CommandContext(ctx, h.config.Command, splitArgs...)
-	splitOut, splitErr := splitCmd.Output()
-	if splitErr != nil {
-		return "", "", false, "", fmt.Errorf("failed to split dedicated worker pane: %w (out: %s)", splitErr, string(splitOut))
+	var newPaneID string
+	var createdTabID string
+	tabCmd := exec.CommandContext(ctx, h.config.Command, tabArgs...)
+	tabOut, tabErr := tabCmd.Output()
+	if tabErr == nil {
+		var tabResp herdrTabCreateResponse
+		if json.Unmarshal(tabOut, &tabResp) == nil && tabResp.Result.RootPane.PaneID != "" {
+			newPaneID = tabResp.Result.RootPane.PaneID
+			createdTabID = tabResp.Result.Tab.TabID
+		}
 	}
 
-	var splitResp herdrPaneSplitResponse
-	if err := json.Unmarshal(splitOut, &splitResp); err != nil || splitResp.Result.Pane.PaneID == "" {
-		return "", "", false, "", fmt.Errorf("failed to parse new pane ID from herdr: %s", string(splitOut))
+	// Fallback to pane split if tab creation failed
+	if newPaneID == "" {
+		splitArgs := []string{"pane", "split", "--direction", "right", "--ratio", "0.5", "--cwd", absCwd, "--no-focus"}
+		if callerPane != "" {
+			splitArgs = append(splitArgs, "--pane", callerPane)
+		}
+		splitCmd := exec.CommandContext(ctx, h.config.Command, splitArgs...)
+		splitOut, splitErr := splitCmd.Output()
+		if splitErr != nil {
+			return "", "", false, "", fmt.Errorf("failed to spawn dedicated worker (tab and split failed): %w (out: %s)", splitErr, string(splitOut))
+		}
+		var splitResp herdrPaneSplitResponse
+		if err := json.Unmarshal(splitOut, &splitResp); err != nil || splitResp.Result.Pane.PaneID == "" {
+			return "", "", false, "", fmt.Errorf("failed to parse new pane ID from herdr: %s", string(splitOut))
+		}
+		newPaneID = splitResp.Result.Pane.PaneID
 	}
-	newPaneID := splitResp.Result.Pane.PaneID
 
-	// 4. Start the agent in the new pane
+	// 4. Start the agent in the new pane (clear any stale registration of the name first)
+	_ = exec.CommandContext(ctx, h.config.Command, "agent", "rename", expectedWorkerName, "--clear").Run()
+
 	startArgs := []string{"agent", "start", expectedWorkerName, "--kind", model, "--pane", newPaneID, "--timeout", "45000"}
 	startCmd := exec.CommandContext(ctx, h.config.Command, startArgs...)
 	startOut, startErr := startCmd.CombinedOutput()
 	if startErr != nil {
-		_ = exec.Command(h.config.Command, "pane", "close", newPaneID).Run()
+		if createdTabID != "" {
+			_ = exec.Command(h.config.Command, "tab", "close", createdTabID).Run()
+		} else {
+			_ = exec.Command(h.config.Command, "pane", "close", newPaneID).Run()
+		}
 		return "", "", false, "", fmt.Errorf("failed to start agent %s in pane %s: %w (out: %s)", model, newPaneID, startErr, string(startOut))
 	}
 
@@ -317,7 +479,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	}
 	h.mu.Unlock()
 
-	target, paneID, isDynamic, threadID, err := h.resolveTarget(ctx, cfg.Model, cfg.Cwd)
+	target, paneID, isDynamic, threadID, err := h.resolveTarget(ctx, key, cfg.Model, cfg.Cwd)
 	if err != nil {
 		return "", false, fmt.Errorf("herdr target resolution: %w", err)
 	}

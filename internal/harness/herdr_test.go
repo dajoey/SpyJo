@@ -108,3 +108,61 @@ func TestCleanHerdrTerminalOutput(t *testing.T) {
 		t.Fatalf("cleanHerdrTerminalOutput = %q, want %q", got, want)
 	}
 }
+
+func TestWorkerNameAndLabel(t *testing.T) {
+	tests := []struct {
+		key          string
+		model        string
+		wantName     string
+		wantTabLabel string
+	}{
+		{
+			key:          "orchestrator:tasks:task_implementation:tasks-20260914-helm-fleet-update-03:1",
+			model:        "opencode",
+			wantName:     "spyjo-task-opencode-helm-fleet-update-03-a1-worker",
+			wantTabLabel: "Task: helm-fleet-update-03 (opencode)",
+		},
+		{
+			key:          "orchestrator:tasks:task_review:tasks-20260914-helm-lmc-verify-02:1",
+			model:        "kimi",
+			wantName:     "spyjo-review-kimi-helm-lmc-verify-02-a1-worker",
+			wantTabLabel: "Review: helm-lmc-verify-02 (kimi)",
+		},
+		{
+			key:          "orchestrator:goals:planning:goals-20260914-202731-helm01:1",
+			model:        "opencode",
+			wantName:     "spyjo-plan-opencode-helm01-a1-worker",
+			wantTabLabel: "Plan: helm01 (opencode)",
+		},
+		{
+			key:          "orchestrator:semantic-heartbeat",
+			model:        "opencode",
+			wantName:     "spyjo-heartbeat-opencode-worker",
+			wantTabLabel: "Heartbeat (opencode)",
+		},
+		{
+			key:          "chat:tui:local-2a0229b8d17f26ca2335fa4eaaf39397",
+			model:        "opencode",
+			wantName:     "spyjo-chat-tui-opencode-2a0229b8-worker",
+			wantTabLabel: "Chat: 2a0229b8 (opencode)",
+		},
+		{
+			key:          "chat:tui:local-71f92e03b302",
+			model:        "opencode",
+			wantName:     "spyjo-chat-tui-opencode-71f92e03-worker",
+			wantTabLabel: "Chat: 71f92e03 (opencode)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.key, func(t *testing.T) {
+			gotName, gotLabel := workerNameAndLabel(tc.key, tc.model)
+			if gotName != tc.wantName {
+				t.Errorf("workerNameAndLabel(%q, %q) name = %q, want %q", tc.key, tc.model, gotName, tc.wantName)
+			}
+			if gotLabel != tc.wantTabLabel {
+				t.Errorf("workerNameAndLabel(%q, %q) label = %q, want %q", tc.key, tc.model, gotLabel, tc.wantTabLabel)
+			}
+		})
+	}
+}
