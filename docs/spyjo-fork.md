@@ -6,6 +6,7 @@ SpyJo is Joey's personal fork of [Spynel](https://github.com/agent0ai/spynel) â€
 
 Local changes on top of upstream (newest first; see `git log` for detail):
 
+- Herdr automated workers isolated into dedicated collision-free workspaces (`[sj-worker] helm`, `[sj-worker] tasks`).
 - Ephemeral Herdr worker tabs auto-close; orphaned tabs are swept on startup.
 - Herdr worker agent names constrained to the 32-character limit.
 - Obsolete deleted primaries auto-retire with immediate takeover.
