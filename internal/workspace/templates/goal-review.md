@@ -13,7 +13,7 @@ Choose exactly one transition:
 
 - `done`: every required criterion is proven. Set `last_review.verdict: done` and `last_review.criteria_satisfied: true`.
 - `planning`: the bar is not yet met and another round is worthwhile. Set `last_review.verdict: continue` and state the gaps and planning recommendations.
-- `waiting`: progress depends on a precise external condition or future checkpoint. Record `waiting_for`, `resume_status: review`, and, when time-based, `wake_at`.
+- `waiting`: progress depends on a precise external condition or future checkpoint. Record `waiting_for` (always quoted, e.g. `waiting_for: "..."`), `resume_status: review`, and, when time-based, `wake_at`. Avoid unquoted prose with colons.
 - `abandoned`: an explicit decision ends the goal without meeting its bar. Record the reason; never disguise abandonment as success.
 
 Before moving the file, obtain the environment's current UTC time, set `last_review.round`, `last_review.reviewed_at`, `updated_at`, and the chosen `status`, append the durable review record, then move it from `reviewing/` to the matching folder. Never estimate or invent timestamps. Never mark a goal done from task counts, indirect evidence, or an incomplete criterion review.

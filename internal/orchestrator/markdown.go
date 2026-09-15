@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,9 +59,68 @@ func ParseDocument(data []byte) (Document, error) {
 	body := normalized[4+end+5:]
 	metadata := map[string]any{}
 	if err := yaml.Unmarshal([]byte(front), &metadata); err != nil {
+		sanitized := sanitizeFrontMatter(front)
+		if retryErr := yaml.Unmarshal([]byte(sanitized), &metadata); retryErr == nil {
+			return Document{FrontMatter: metadata, Body: body}, nil
+		}
 		return Document{}, err
 	}
 	return Document{FrontMatter: metadata, Body: body}, nil
+}
+
+// sanitizeFrontMatter fixes common LLM authoring mistakes where natural prose
+// containing colons is emitted as an unquoted YAML scalar (for example,
+// `waiting_for: Joey's decision (questions 1-4: picks stand)` or
+// `outcome: Progress: completed...`). These violate YAML's mapping key rules
+// and cause "mapping values are not allowed in this context".
+func sanitizeFrontMatter(front string) string {
+	lines := strings.Split(front, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			result = append(result, line)
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			result = append(result, line)
+			continue
+		}
+		prefix := line[:idx+1]
+		keyPart := strings.TrimSpace(prefix[:len(prefix)-1])
+		if strings.HasPrefix(keyPart, "- ") {
+			keyPart = strings.TrimSpace(keyPart[2:])
+		}
+		if strings.ContainsAny(keyPart, " \t\"'") {
+			result = append(result, line)
+			continue
+		}
+		valWithSpaces := line[idx+1:]
+		valTrimmed := strings.TrimSpace(valWithSpaces)
+		if valTrimmed == "" {
+			result = append(result, line)
+			continue
+		}
+		if strings.HasPrefix(valTrimmed, "\"") || strings.HasPrefix(valTrimmed, "'") ||
+			strings.HasPrefix(valTrimmed, "|") || strings.HasPrefix(valTrimmed, ">") ||
+			strings.HasPrefix(valTrimmed, "[") || strings.HasPrefix(valTrimmed, "{") {
+			result = append(result, line)
+			continue
+		}
+		if strings.Contains(valTrimmed, ": ") || strings.HasSuffix(valTrimmed, ":") ||
+			strings.HasPrefix(valTrimmed, "@") || strings.HasPrefix(valTrimmed, "`") {
+			spaceLen := len(valWithSpaces) - len(strings.TrimLeft(valWithSpaces, " \t"))
+			spacing := valWithSpaces[:spaceLen]
+			if spacing == "" {
+				spacing = " "
+			}
+			result = append(result, prefix+spacing+strconv.Quote(valTrimmed))
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.Join(result, "\n")
 }
 
 func (d Document) Bytes() ([]byte, error) {
