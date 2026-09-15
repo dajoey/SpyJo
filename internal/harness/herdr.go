@@ -237,7 +237,7 @@ func (h *Herdr) resolveCallerContext(ctx context.Context, cwd string) (string, s
 			if json.Unmarshal(outWorkspaces, &wResp) == nil {
 				for _, ws := range wResp.Result.Workspaces {
 					lower := strings.ToLower(ws.Label)
-					if strings.Contains(lower, "spyjo") || strings.Contains(lower, "spy") {
+					if strings.Contains(lower, "[sj-worker]") {
 						workspaceID = ws.WorkspaceID
 						break
 					}
@@ -253,6 +253,111 @@ func (h *Herdr) resolveCallerContext(ctx context.Context, cwd string) (string, s
 		workspaceID = "w6"
 	}
 	return callerPane, workspaceID
+}
+
+func workerSubject(key string) string {
+	cleanKey := strings.ToLower(strings.TrimSpace(key))
+	if strings.Contains(cleanKey, "helm") {
+		return "helm"
+	}
+	if strings.HasPrefix(cleanKey, "orchestrator:") || cleanKey == "heartbeat" {
+		parts := strings.Split(cleanKey, ":")
+		if len(parts) >= 4 {
+			id := parts[3]
+			if strings.Contains(id, "helm") {
+				return "helm"
+			}
+		}
+		return "tasks"
+	}
+	if strings.HasPrefix(cleanKey, "chat:") {
+		parts := strings.Split(cleanKey, ":")
+		if len(parts) >= 2 && parts[1] != "" {
+			return parts[1]
+		}
+		return "chat"
+	}
+	return "tasks"
+}
+
+func workerWorkspaceLabel(subject string) string {
+	subject = strings.TrimSpace(strings.ToLower(subject))
+	if subject == "" {
+		subject = "tasks"
+	}
+	return fmt.Sprintf("[sj-worker] %s", subject)
+}
+
+func (h *Herdr) resolveDedicatedWorkspace(ctx context.Context, subject string, cwd string) (string, error) {
+	targetLabel := workerWorkspaceLabel(subject)
+
+	absCwd := cwd
+	if abs, err := filepath.Abs(cwd); err == nil {
+		absCwd = abs
+	}
+
+	// 1. Check existing workspaces for exact label match (case-insensitive)
+	outWorkspaces, err := exec.CommandContext(ctx, h.config.Command, "workspace", "list").Output()
+	if err == nil {
+		var wResp struct {
+			Result struct {
+				Workspaces []struct {
+					WorkspaceID string `json:"workspace_id"`
+					Label       string `json:"label"`
+				} `json:"workspaces"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(outWorkspaces, &wResp) == nil {
+			for _, ws := range wResp.Result.Workspaces {
+				if strings.EqualFold(strings.TrimSpace(ws.Label), targetLabel) {
+					return ws.WorkspaceID, nil
+				}
+			}
+		}
+	}
+
+	// 2. Not found: create dedicated workspace with --no-focus
+	createArgs := []string{"workspace", "create", "--label", targetLabel, "--cwd", absCwd, "--no-focus"}
+	outCreate, err := exec.CommandContext(ctx, h.config.Command, createArgs...).Output()
+	if err == nil {
+		var cResp struct {
+			Result struct {
+				WorkspaceID string `json:"workspace_id"`
+				Workspace   struct {
+					WorkspaceID string `json:"workspace_id"`
+				} `json:"workspace"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(outCreate, &cResp) == nil {
+			if cResp.Result.Workspace.WorkspaceID != "" {
+				return cResp.Result.Workspace.WorkspaceID, nil
+			}
+			if cResp.Result.WorkspaceID != "" {
+				return cResp.Result.WorkspaceID, nil
+			}
+		}
+	}
+
+	// 3. Fallback: list workspaces again after create attempt
+	if outWorkspaces, err := exec.CommandContext(ctx, h.config.Command, "workspace", "list").Output(); err == nil {
+		var wResp struct {
+			Result struct {
+				Workspaces []struct {
+					WorkspaceID string `json:"workspace_id"`
+					Label       string `json:"label"`
+				} `json:"workspaces"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(outWorkspaces, &wResp) == nil {
+			for _, ws := range wResp.Result.Workspaces {
+				if strings.EqualFold(strings.TrimSpace(ws.Label), targetLabel) {
+					return ws.WorkspaceID, nil
+				}
+			}
+		}
+	}
+
+	return "", err
 }
 
 var reLeadingDate = regexp.MustCompile(`^\d{8}(?:-\d{6})?-`)
@@ -420,13 +525,28 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 		return model, model, "", false, "", nil
 	}
 
-	callerPane, workspaceID := h.resolveCallerContext(ctx, cwd)
-	expectedWorkerName, tabLabel := workerNameAndLabel(key, model)
-
+	cleanKey := strings.TrimSpace(key)
 	absCwd := cwd
 	if abs, err := filepath.Abs(cwd); err == nil {
 		absCwd = abs
 	}
+
+	var callerPane string
+	var workspaceID string
+
+	if isOrchestratorKey(cleanKey) || strings.HasPrefix(cleanKey, "chat:telegram") {
+		subj := workerSubject(cleanKey)
+		wsID, err := h.resolveDedicatedWorkspace(ctx, subj, absCwd)
+		if err == nil && wsID != "" {
+			workspaceID = wsID
+		}
+	}
+
+	if workspaceID == "" {
+		callerPane, workspaceID = h.resolveCallerContext(ctx, cwd)
+	}
+
+	expectedWorkerName, tabLabel := workerNameAndLabel(key, model)
 
 	// 2. Search for existing dedicated worker agent in this workspace
 	cmd := exec.CommandContext(ctx, h.config.Command, "agent", "list")
@@ -986,7 +1106,26 @@ func (h *Herdr) cleanupCompletedTab(tabID, paneID, agentName string) {
 // sweepOrphanedWorkers cleans up any abandoned worker tabs or agent registrations
 // from previous crashed or aborted sessions in this workspace on startup.
 func (h *Herdr) sweepOrphanedWorkers(ctx context.Context) {
-	_, workspaceID := h.resolveCallerContext(ctx, h.config.Cwd)
+	// Find all dedicated worker workspaces matching "[sj-worker]"
+	workerWorkspaceIDs := make(map[string]bool)
+	if outW, err := exec.CommandContext(ctx, h.config.Command, "workspace", "list").Output(); err == nil {
+		var wResp struct {
+			Result struct {
+				Workspaces []struct {
+					WorkspaceID string `json:"workspace_id"`
+					Label       string `json:"label"`
+				} `json:"workspaces"`
+			} `json:"result"`
+		}
+		if json.Unmarshal(outW, &wResp) == nil {
+			for _, ws := range wResp.Result.Workspaces {
+				if strings.Contains(strings.ToLower(ws.Label), "[sj-worker]") {
+					workerWorkspaceIDs[ws.WorkspaceID] = true
+				}
+			}
+		}
+	}
+
 	out, err := exec.CommandContext(ctx, h.config.Command, "agent", "list").Output()
 	if err != nil {
 		return
@@ -996,16 +1135,17 @@ func (h *Herdr) sweepOrphanedWorkers(ctx context.Context) {
 		return
 	}
 	for _, a := range listResp.Result.Agents {
-		inWorkspace := workspaceID == "" || a.WorkspaceID == workspaceID || strings.HasPrefix(a.PaneID, workspaceID+":")
-		if !inWorkspace {
-			continue
-		}
 		// Only sweep background worker agents (not chat sj-c-*, not external agents)
 		isOrphanWorker := strings.HasPrefix(a.Name, "sj-t-") ||
 			strings.HasPrefix(a.Name, "sj-r-") ||
 			strings.HasPrefix(a.Name, "sj-o-") ||
 			strings.HasPrefix(a.Name, "sj-hb-")
 		if !isOrphanWorker {
+			continue
+		}
+
+		// Only sweep if the worker is in a dedicated [sj-worker] workspace
+		if len(workerWorkspaceIDs) > 0 && !workerWorkspaceIDs[a.WorkspaceID] {
 			continue
 		}
 		if a.TabID != "" {

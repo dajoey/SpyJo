@@ -172,3 +172,50 @@ func TestWorkerNameAndLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerSubjectAndWorkspaceLabel(t *testing.T) {
+	tests := []struct {
+		key         string
+		wantSubject string
+		wantLabel   string
+	}{
+		{
+			key:         "orchestrator:tasks:task_implementation:tasks-helm-t-joey-1789190796770-1789493241:1",
+			wantSubject: "helm",
+			wantLabel:   "[sj-worker] helm",
+		},
+		{
+			key:         "orchestrator:tasks:task_review:tasks-20260914-helm-lmc-verify-02:1",
+			wantSubject: "helm",
+			wantLabel:   "[sj-worker] helm",
+		},
+		{
+			key:         "orchestrator:tasks:task_implementation:tasks-20260914-bst-prioritize-01:1",
+			wantSubject: "tasks",
+			wantLabel:   "[sj-worker] tasks",
+		},
+		{
+			key:         "orchestrator:semantic-heartbeat",
+			wantSubject: "tasks",
+			wantLabel:   "[sj-worker] tasks",
+		},
+		{
+			key:         "chat:telegram:1701167661",
+			wantSubject: "telegram",
+			wantLabel:   "[sj-worker] telegram",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.key, func(t *testing.T) {
+			gotSubject := workerSubject(tc.key)
+			if gotSubject != tc.wantSubject {
+				t.Errorf("workerSubject(%q) = %q, want %q", tc.key, gotSubject, tc.wantSubject)
+			}
+			gotLabel := workerWorkspaceLabel(gotSubject)
+			if gotLabel != tc.wantLabel {
+				t.Errorf("workerWorkspaceLabel(%q) = %q, want %q", gotSubject, gotLabel, tc.wantLabel)
+			}
+		})
+	}
+}
