@@ -25,6 +25,7 @@ type Herdr struct {
 
 	keyMu    sync.Mutex
 	keyLocks map[string]*sync.Mutex
+	wsMu     sync.Mutex
 	mu       sync.Mutex
 	sessions map[string]string
 	active   map[string]*herdrTurn
@@ -289,6 +290,9 @@ func workerWorkspaceLabel(subject string) string {
 }
 
 func (h *Herdr) resolveDedicatedWorkspace(ctx context.Context, subject string, cwd string) (string, error) {
+	h.wsMu.Lock()
+	defer h.wsMu.Unlock()
+
 	targetLabel := workerWorkspaceLabel(subject)
 
 	absCwd := cwd
