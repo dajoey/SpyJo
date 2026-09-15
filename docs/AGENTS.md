@@ -2,40 +2,15 @@
 
 ## Purpose
 
-- Own durable user, protocol, configuration, architecture, and release documentation.
+- Own the slim SpyJo fork documentation set: fork intent, upstream differences, setup/usage deltas, and pointers to canonical upstream docs. Full product documentation lives upstream; this directory must not regrow verbatim upstream copies.
 
 ## Local Contracts
 
-- Commands and configuration examples must match executable behavior and embedded defaults.
-- Keep public positioning aligned with the root product contract and `docs/vision.md`: Spynel is a classic non-AI orchestration program, external harnesses provide intelligence, and the single “agent” in the relationship slogan denotes the human-facing assistant interface. Adapt copy length to its surface without inventing product facts or treating conceptual scale as a resource guarantee.
+- `spyjo-fork.md` owns intent, the current differences list, setup/usage deltas, and pinned upstream links. `README.md` stays a short index into it.
+- Keep public positioning aligned with the root README: SpyJo is Joey's personal fork/customization of Spynel, not a competitor. Adapt copy length to its surface without inventing product facts or treating conceptual scale as a resource guarantee.
+- Commands and configuration examples must match executable behavior: the command is `spyjo` (with a `spynel` alias where installed), built from `./cmd/spyjo` via `scripts/dev.sh build` and installed via `scripts/install-dev.sh`. Never document the upstream `install.sh`/npm paths as the way to install this fork.
+- Keep upstream links pinned to the immutable tag recorded in `spyjo-fork.md`; re-pin only when the fork's upstream base moves.
 - Keep root-README image assets under `.github/resources/`; `docs/` owns documentation content rather than repository-presentation artwork.
-- Document `.spynel/config.yaml` as the canonical private configuration, workspace-root-relative path resolution, the fixed non-configurable `.spynel` state directory, and validation of current settings, ignored unused input keys, and their removal on the next canonical save.
-- Keep `docs/agent-docs.md`, the curated `internal/agentdocs` catalog, concise `/help` metadata, harness prompt guidance, and CLI examples synchronized. Static documentation must remain offline, bounded, classified, and free of live/private workspace data.
-- Clearly distinguish server-only operation, the interactive TUI, and the non-visual automation CLI.
-- Document persistent per-agent instruction role mapping, precedence, fresh loading, safe file constraints, memory-edit behavior, and the content-free inspection command distinctly from prompts, DOX, workflows, history, and harness configuration.
-- Document secret handling, fail-closed Telegram and WhatsApp access lists, required Telegram webhook verification, transport delivery/account modes, WhatsApp QR/session persistence, Codex, Claude Code, Agent Zero CLI, Pi, ACP-alias, and custom-ACP prerequisites, local Parakeet languages/formats/resource limits, startup registration, conversation branching, and extension trust.
-- Describe autostart as one action selected from verified native state, with disable/enable repair and explicit errors. Distinguish a saved preference, verified registration, and running-process health; document root boot versus per-user login startup and preserved home/config/cache paths.
-- Document detected model reasoning/service capabilities and Custom model/effort entry when discovery is missing or incorrect, including provider validation of manual identifiers, dependent selection, inherit/reset semantics, invalidation behavior, and atomic dispatch snapshots. Preserve the ACP effort and capability-validated service boundaries.
-- Document that WhatsApp setup automatically saves and enables the channel after access configuration, then opens pairing without a separate enable-choice step.
-- Document that WhatsApp QR pairing uses a chrome-free full-terminal view exited by any key, expired/error sessions retry automatically without restarting Spynel, the manual retry action is only an immediate override, and phone-number linking codes are the supported non-QR alternative.
-- Document transport-specific Markdown rendering and terminal limitations around pasted file data.
-- Document response-delivery differences: the TUI exposes live progress, explicit CLI streaming remains opt-in, and Telegram/WhatsApp send only the last terminal response or error.
-- Document the human-facing communication boundary: routine delegation and completion confirmations are brief, natural, outcome-first, and hide internal paths/IDs/metrics; explicit detail requests and dedicated diagnostic commands remain precise, and remote routine confirmations never render local-path links.
-- Distinguish bounded in-memory/display windows from complete disk-backed histories and attachments.
-- Document plain-CLI output contracts precisely: the last assistant-message item by default, all response deltas with `--stream`, NDJSON events with `send --json` and shared command aliases using `--json`, structured JSON for status/history queries, and flags before positional command arguments.
-- Keep the finite-task and multi-round-goal workflow distinction, queue/claimed statuses, phase leases and crash recovery, controlled phase-owned dead-end recovery, runtime `## Progress` journaling, task-goal round links, waiting wakeups, direct agent-owned transition notifications, agent-decided heartbeat reminders without framework reminder policy/state, independent review semantics, inspectable heartbeat and notification-agent jobs, and both explicit-origin and recent-authorized `spynel notify` behavior consistent across CLI, configuration, integrations, architecture, and README documentation.
-- Document task-agent notification commands with concrete absolute `--workdir`, exact authorized `--origin`, and ordinary `--message` arguments; placeholders and stdin composition are not task-agent guidance.
-- Describe job, task, and goal inspection/control as workspace-global after transport or loopback authentication. Never present caller conversation, creation channel, or `notify.origin` as an access-control boundary; keep notification origin documented as outbound routing metadata and preserve bounded privacy-safe projections.
-- Document both npm and the root POSIX script installation paths, installation-local ownership, explicit updates, stable restart paths, retained old bundles, mirror/version overrides, and the first-release/public-routing prerequisite.
-- Document npm release triggering, native asset coverage, first-publication credentials versus OIDC trusted publishing, bounded interactive update checks, automatic-startup suppression, and `/update`.
-- Document Linux amd64/arm64 and macOS amd64/arm64 as the only current distribution targets, with Windows explicitly and temporarily unsupported by both native packaging and npm.
-- Keep authenticated provider canaries gated by the reviewed threat model: synthetic repositories only, disposable identities and homes, verified artifacts, bounded egress/cost/time, sanitized evidence, and per-run authorization. A plan or CI definition is not evidence that a provider was executed.
-
-- `programmatic-integration.md` owns the supported v1 HTTP/NDJSON contract, request admission/retry limits, committed subscription/replay semantics, snapshot resynchronization, private Unix socket topology/limits, and runnable adapter/local-test examples. Keep the compiled integration topic and CLI help synchronized.
-
-- Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
-
-- Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
 
 ## Child DOX Index
 
