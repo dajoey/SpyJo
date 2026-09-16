@@ -775,6 +775,9 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		if raw == "" {
 			raw = strings.TrimSpace(string(promptOut))
 		}
+		if strings.Contains(raw, "monthly spending limit") || strings.Contains(raw, "spending limit") {
+			return threadID, false, fmt.Errorf("provider spending limit reached: %s", raw)
+		}
 		finalText = cleanHerdrTerminalOutput(raw)
 		if finalText == "" {
 			finalText = raw

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -58,6 +59,7 @@ type Manager struct {
 	Harness                  harness.Harness
 	Hooks                    extensions.Runner
 	Log                      func(string)
+	LogError                 func(component, event, message string)
 	JobStarted               func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error)
 	JobUpdated               func(id int, lease Lease)
 	JobTimingUpdated         func(id int, firstAssignedAt time.Time, providerIterations int)
@@ -1498,7 +1500,11 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 			continue
 		}
 		foreignOwner := lease.OwnerID != "" && lease.OwnerID != m.ownerID
-		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < route.StaleAfter) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
+		staleThreshold := route.StaleAfter
+		if lease.State == "error" {
+			staleThreshold = 10 * time.Second
+		}
+		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < staleThreshold) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
 			continue
 		}
 		lease.OwnerID = m.ownerID
@@ -1920,12 +1926,77 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 
 func (m *Manager) recordError(lease Lease, err error) {
 	lease.LastError = err.Error()
+	lease.RecoveryCount++
 	lease.State = "error"
 	lease.HeartbeatAt = time.Now().UTC()
+
+	route, ok := routeByName(lease.Route)
+	if ok && lease.RecoveryCount >= 3 && route.Name == "tasks" {
+		base := filepath.Dir(m.Config.Resolve(route.Source))
+		failedTarget := filepath.Join(base, "failed", filepath.Base(lease.File))
+		note := fmt.Sprintf("Terminal failure: task moved to failed/ after %d consecutive dispatch/execution errors: %v", lease.RecoveryCount, err)
+		if moveErr := moveDocumentWithProgress(lease.File, failedTarget, "failed", time.Now().UTC(), note); moveErr == nil {
+			_ = os.Remove(m.leasePath(lease.ID))
+			m.finishRuntimeJob(lease.ID)
+			m.log(fmt.Sprintf("abandoned repeatedly failing task %s into failed/: %v", lease.File, err))
+			go m.captureAutopsyAndAlert(lease, fmt.Errorf("task failed after %d attempts: %w", lease.RecoveryCount, err))
+			return
+		}
+	}
+
 	if saveErr := m.saveLease(lease); saveErr != nil {
 		m.log("save failed lease: " + saveErr.Error())
 	}
-	m.log(fmt.Sprintf("dispatch %s: %v", lease.File, err))
+	msg := fmt.Sprintf("dispatch %s: %v", lease.File, err)
+	if m.LogError != nil {
+		m.LogError("orchestrator", "dispatch_error", msg)
+	} else {
+		m.log(msg)
+	}
+	go m.captureAutopsyAndAlert(lease, err)
+}
+
+func (m *Manager) captureAutopsyAndAlert(lease Lease, err error) {
+	if err == nil {
+		return
+	}
+	diagDir := m.Config.StatePath("diagnostics")
+	if mkErr := os.MkdirAll(diagDir, 0o700); mkErr != nil {
+		return
+	}
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	filename := fmt.Sprintf("err-%s-%s.json", timestamp, lease.ID)
+	diagPath := filepath.Join(diagDir, filename)
+
+	autopsy := map[string]any{
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+		"lease_id":    lease.ID,
+		"claim_id":    lease.ClaimID,
+		"file":        lease.File,
+		"route":       lease.Route,
+		"session_key": lease.SessionKey,
+		"thread_id":   lease.ThreadID,
+		"error":       err.Error(),
+		"state":       lease.State,
+	}
+
+	if data, mErr := json.MarshalIndent(autopsy, "", "  "); mErr == nil {
+		_ = os.WriteFile(diagPath, data, 0o600)
+	}
+
+	alerterPath := "/home/dajoey/ops/telemetry_alerter.py"
+	if _, statErr := os.Stat(alerterPath); statErr == nil {
+		taskName := filepath.Base(lease.File)
+		cmd := exec.Command("python3", alerterPath,
+			"--title", "Runner Dispatch Error",
+			"--component", "spyjo-orchestrator",
+			"--error", err.Error(),
+			"--severity", "P1",
+			"--task-id", taskName,
+			"--runner", lease.SessionKey,
+		)
+		_ = cmd.Run()
+	}
 }
 
 func (m *Manager) isInflight(key string) bool {

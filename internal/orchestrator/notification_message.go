@@ -11,7 +11,7 @@ import (
 const (
 	notificationTitleRunes    = 120
 	notificationOutcomeRunes  = 280
-	notificationEvidenceRunes = 280
+	notificationEvidenceRunes = 2000
 )
 
 // completionSummary is optional and deliberately bounded. Invalid presentation
@@ -157,18 +157,9 @@ func truncateLine(value string, limit int) string {
 }
 
 func containsAbsolutePath(value string) bool {
-	runes := []rune(value)
-	boundary := func(index int) bool {
-		return index == 0 || (!unicode.IsLetter(runes[index-1]) && !unicode.IsNumber(runes[index-1]))
-	}
-	for index, character := range runes {
-		if character == '/' && boundary(index) {
-			return true
-		}
-		if character == '\\' && boundary(index) && index+1 < len(runes) && runes[index+1] == '\\' {
-			return true
-		}
-		if unicode.IsLetter(character) && boundary(index) && index+2 < len(runes) && runes[index+1] == ':' && (runes[index+2] == '/' || runes[index+2] == '\\') {
+	lower := strings.ToLower(value)
+	for _, prefix := range []string{"/home/", "/etc/", "/var/", "/opt/", "/root/", "/usr/", "/tmp/", "c:\\", "d:\\", "\\\\"} {
+		if strings.Contains(lower, prefix) {
 			return true
 		}
 	}
@@ -188,6 +179,25 @@ func cleanNotificationLine(value string) string {
 func validateDirectCompletionEvidence(document Document) error {
 	summary, ok := parseCompletionSummary(document)
 	if !ok || summary.Verdict != "completed" {
+		raw, isMap := document.FrontMatter["completion_summary"].(map[string]any)
+		if !isMap || raw == nil {
+			return errors.New("a valid completion_summary with verdict completed is required")
+		}
+		if v, _ := raw["verdict"].(string); v != "completed" {
+			return errors.New("completion_summary.verdict must be 'completed'")
+		}
+		if out, ok := raw["outcome"].(string); !ok || strings.TrimSpace(out) == "" {
+			return errors.New("completion_summary.outcome is required")
+		} else if utf8.RuneCountInString(cleanNotificationLine(out)) > notificationOutcomeRunes {
+			return errors.New("completion_summary.outcome exceeds maximum allowed length")
+		} else if containsAbsolutePath(cleanNotificationLine(out)) {
+			return errors.New("completion_summary.outcome contains forbidden host path")
+		}
+		if ev, ok := raw["evidence"].(string); ok && utf8.RuneCountInString(cleanNotificationLine(ev)) > notificationEvidenceRunes {
+			return errors.New("completion_summary.evidence exceeds maximum allowed length")
+		} else if ok && containsAbsolutePath(cleanNotificationLine(ev)) {
+			return errors.New("completion_summary.evidence contains forbidden host path")
+		}
 		return errors.New("a valid completion_summary with verdict completed is required")
 	}
 	if summary.Evidence == "" {

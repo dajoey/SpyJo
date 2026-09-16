@@ -232,6 +232,13 @@ func (p *runtimeLogPersistence) appendSync(entry LogEntry, flush bool) error {
 	if err == nil && flush {
 		err = p.file.Sync()
 	}
+	if entry.Level == "error" || entry.Level == "fatal" {
+		errorLogPath := filepath.Join(p.directory, "errors.jsonl")
+		if ef, openErr := os.OpenFile(errorLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); openErr == nil {
+			_, _ = ef.Write(data)
+			_ = ef.Close()
+		}
+	}
 	return err
 }
 

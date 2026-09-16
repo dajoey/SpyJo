@@ -158,6 +158,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	}
 	manager.Cleanup = service.runAutomaticCleanup
 	manager.Log = func(message string) { runtime.LogEvent("info", "orchestrator", "lifecycle", message) }
+	manager.LogError = func(component, event, message string) { runtime.LogEvent("error", component, event, message) }
 	manager.JobStarted = func(lease orchestrator.Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error) {
 		kind := lease.DocumentType
 		if kind == "" {
