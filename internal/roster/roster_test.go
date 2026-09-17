@@ -3,8 +3,11 @@ package roster
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const sample = `
@@ -99,5 +102,75 @@ func TestAssignCapsCountOncePerSessionAndResetDaily(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "runtime", usageFileName)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+const notifySample = `
+staff:
+  thinker:
+    runner: opencode
+  principal:
+    runner: claude
+    notify_at: 2
+    daily_cap: 4
+    fallback: thinker
+roles:
+  goal_planning: principal
+`
+
+func TestNotifyAtAsksOnceAndJoeyDecides(t *testing.T) {
+	day := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	ask := func(dir string) string {
+		return filepath.Join(dir, "tasks", "waiting", "tasks-20260917-roster-cap-principal.md")
+	}
+	decide := func(dir, value string) {
+		data := `{"date":"2026-09-17","staff":{"principal":"` + value + `"}}`
+		if err := os.WriteFile(filepath.Join(dir, "runtime", decisionsFileName), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(dir string, r *Roster, keys []string, want string) {
+		t.Helper()
+		for _, key := range keys {
+			if got, err := r.Assign(dir, "principal", key, day); err != nil || got != want {
+				t.Fatalf("%s: got %q, %v; want %q", key, got, err, want)
+			}
+		}
+	}
+
+	// No answer: keeps working past notify_at, halts at daily_cap.
+	dir := write(t, notifySample)
+	r, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run(dir, r, []string{"a1"}, "principal")
+	if _, err := os.Stat(ask(dir)); err == nil {
+		t.Fatal("asked before notify_at")
+	}
+	run(dir, r, []string{"a2"}, "principal")
+	data, err := os.ReadFile(ask(dir))
+	if err != nil || !strings.Contains(string(data), "joey_ask:") || !strings.Contains(string(data), `value: "stop"`) {
+		t.Fatalf("ask not filed: %v", err)
+	}
+	var front map[string]any
+	if err := yaml.Unmarshal([]byte(strings.SplitN(string(data), "---\n", 3)[1]), &front); err != nil {
+		t.Fatalf("ask front matter: %v", err)
+	}
+	os.Remove(ask(dir))
+	run(dir, r, []string{"a3", "a4"}, "principal")
+	if _, err := os.Stat(ask(dir)); err == nil {
+		t.Fatal("asked twice in one day")
+	}
+	run(dir, r, []string{"a5"}, "thinker")
+
+	// "continue" lifts daily_cap; "stop" halts at once.
+	decide(dir, DecisionContinue)
+	run(dir, r, []string{"a6"}, "principal")
+	decide(dir, DecisionStop)
+	run(dir, r, []string{"a7"}, "thinker")
+
+	if _, err := Load(write(t, strings.Replace(notifySample, "notify_at: 2", "notify_at: 4", 1))); err == nil {
+		t.Fatal("notify_at at or above daily_cap must fail")
 	}
 }
