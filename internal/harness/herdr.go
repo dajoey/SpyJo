@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -742,6 +743,24 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		promptOut, promptErr = promptCmd.CombinedOutput()
 	}
 
+	// herdr's --wait gives up after 15 minutes even while the agent is still
+	// working. Treating that as a failure closed the worker tab mid-task and sent
+	// a recovery agent to redo the work (8 times 2026-09-15..17, spyjo-observer).
+	// Keep waiting while herdr still reports the agent working, up to a ceiling.
+	if promptErr != nil && isHerdrWaitTimeout(string(promptOut)) {
+		promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling,
+			func(ctx context.Context, args ...string) ([]byte, error) {
+				cmd := exec.CommandContext(ctx, h.config.Command, args...)
+				turn.cmd = cmd
+				return cmd.CombinedOutput()
+			},
+			func(text string) {
+				if emit != nil {
+					emit(core.Event{Kind: core.EventStatus, Text: text})
+				}
+			})
+	}
+
 	close(streamDone)
 
 	// Inspect final agent state
@@ -1036,6 +1055,60 @@ func (h *Herdr) Close() error {
 		turn.cancel()
 	}
 	return nil
+}
+
+// herdrWaitCeiling bounds one worker turn including the initial 15-minute
+// prompt wait. A genuinely hung agent that herdr still reports as working is
+// left to the ops watchdog's liveness checks until then.
+const herdrWaitCeiling = 2 * time.Hour
+
+func isHerdrWaitTimeout(output string) bool {
+	return strings.Contains(output, "timed out waiting for agent status")
+}
+
+type herdrRunner func(ctx context.Context, args ...string) ([]byte, error)
+
+// extendHerdrWait keeps waiting on a worker whose prompt wait timed out while
+// herdr still reports it working. It returns success once the agent reaches
+// idle/done, hands blocked or vanished agents back with the original failure so
+// the caller's blocked/error handling runs, and gives up at the ceiling.
+func extendHerdrWait(ctx context.Context, target string, out []byte, err error, ceiling time.Duration, run herdrRunner, status func(string)) ([]byte, error) {
+	started := time.Now()
+	deadline := started.Add(ceiling - 15*time.Minute)
+	for {
+		getOut, getErr := run(ctx, "agent", "get", target)
+		if getErr != nil {
+			return out, err
+		}
+		var resp herdrAgentGetResponse
+		if json.Unmarshal(getOut, &resp) != nil {
+			return out, err
+		}
+		switch resp.Result.Agent.AgentStatus {
+		case "idle", "done":
+			return getOut, nil
+		case "working":
+		default:
+			return out, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || ctx.Err() != nil {
+			return out, err
+		}
+		step := min(15*time.Minute, remaining)
+		status(fmt.Sprintf("Herdr: %s still working past the prompt wait; waiting up to %s more", target, step.Round(time.Second)))
+		waitOut, waitErr := run(ctx, "agent", "wait", target, "--timeout", strconv.FormatInt(step.Milliseconds(), 10))
+		if waitErr == nil {
+			return waitOut, nil
+		}
+		if ctx.Err() != nil {
+			return waitOut, waitErr
+		}
+		if !isHerdrWaitTimeout(string(waitOut)) {
+			return waitOut, waitErr
+		}
+		out, err = waitOut, waitErr
+	}
 }
 
 func herdrStatusInterval(key string) time.Duration {
