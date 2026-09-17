@@ -33,6 +33,8 @@ func (m *Manager) notificationTimeout() time.Duration {
 // the task transition currently being reconciled. Notification decisions and
 // task-log writes belong entirely to that agent; Spynel does not persist or
 // interpret a notification-specific result.
+var errTaskNotificationsDisabled = errors.New("task notification metadata is not enabled")
+
 func (m *Manager) startTaskNotificationAgent(parent context.Context, lease Lease, outcome, taskFile string) {
 	m.jobs.Add(1)
 	go func() {
@@ -54,6 +56,9 @@ func (m *Manager) runTaskNotificationAgent(parent context.Context, source Lease,
 		StartedAt: startedAt, HeartbeatAt: startedAt,
 	}
 	prompt, err := m.notificationAgentPrompt(taskFile, outcome)
+	if errors.Is(err, errTaskNotificationsDisabled) {
+		return // notify.enabled false is the task's ordinary choice, not a rejection worth logging
+	}
 	if err != nil {
 		m.log("notification agent prompt rejected: " + err.Error())
 		return
@@ -91,7 +96,7 @@ func (m *Manager) notificationAgentPrompt(taskFile, outcome string) (string, err
 		return "", fmt.Errorf("validate task notification metadata: %w", err)
 	}
 	if !policy.Enabled {
-		return "", errors.New("task notification metadata is not enabled")
+		return "", errTaskNotificationsDisabled
 	}
 	if !policy.Outcomes[outcome] {
 		return "", fmt.Errorf("task notification outcome %q is not authorized", outcome)
