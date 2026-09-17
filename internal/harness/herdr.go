@@ -700,8 +700,12 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		}
 	}()
 
-	// Background status ticker while agent is processing prompt
-	streamTicker := time.NewTicker(2 * time.Second)
+	// Background status ticker while agent is processing prompt. Chat panes keep
+	// a 2s cadence for the live UI. Orchestrator workers use 30s: every status
+	// event also rewrites the job lease, and at 2s these lines were 82-99% of all
+	// durable job output (spyjo-observer 2026-09-17). 30s stays far inside the
+	// 30-minute task / 2-hour goal stale thresholds that the lease heartbeat feeds.
+	streamTicker := time.NewTicker(herdrStatusInterval(cleanKey))
 	streamDone := make(chan struct{})
 	go func() {
 		defer streamTicker.Stop()
@@ -1032,6 +1036,13 @@ func (h *Herdr) Close() error {
 		turn.cancel()
 	}
 	return nil
+}
+
+func herdrStatusInterval(key string) time.Duration {
+	if isOrchestratorKey(key) {
+		return 30 * time.Second
+	}
+	return 2 * time.Second
 }
 
 func isOrchestratorKey(key string) bool {
