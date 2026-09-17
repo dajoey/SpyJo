@@ -787,3 +787,42 @@ func TestDirectCompletionRejectionNamesTheFailingRule(t *testing.T) {
 		})
 	}
 }
+
+func TestReviewQueueClaimsCapacityBeforeNewImplementation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Orchestrator.MaxParallel = 1
+	route := workflowRoutes()[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	reviewed, err := Create(cfg, "tasks", "implemented and awaiting review", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewName := filepath.Base(reviewed)
+	if err := moveDocument(reviewed, filepath.Join(base, "review", reviewName), "review", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := Create(cfg, "tasks", "not started yet", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	fake := newFakeRecipient()
+	fake.beforeEmit = func() { <-release }
+	manager := New(cfg, fake, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "reviewing", reviewName)); err != nil {
+		t.Fatalf("the waiting review did not take the only free slot: %v", err)
+	}
+	if _, err := os.Stat(queued); err != nil {
+		t.Fatalf("new implementation took capacity ahead of the waiting review: %v", err)
+	}
+	close(release)
+	manager.Wait()
+}

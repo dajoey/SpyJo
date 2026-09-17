@@ -473,18 +473,12 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 	if err := m.advanceActiveGoals(); err != nil {
 		return err
 	}
-	for _, route := range workflowRoutes() {
-		var err error
-		switch route.Name {
-		case "tasks":
-			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseTaskImplementation)
-		case "goals":
-			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseGoalPlanning)
-		}
-		if err != nil {
-			return fmt.Errorf("route %s: %w", route.Name, err)
-		}
-	}
+	// Finish before starting: review queues claim free capacity ahead of new
+	// implementation and planning. Implementation-first starved reviews behind
+	// a whole batch (spyjo-observer 2026-09-17: cronaudit-01/02 sat in review
+	// while 03/04 started), so nothing finished until the batch drained,
+	// reviewer findings could not inform later tasks, and reviews verified
+	// systems that later tasks had already changed.
 	for _, route := range workflowRoutes() {
 		base := filepath.Dir(cfg.Resolve(route.Source))
 		var phase string
@@ -498,6 +492,18 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 		}
 		if err := m.scanPhaseQueue(ctx, route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phase); err != nil {
 			return err
+		}
+	}
+	for _, route := range workflowRoutes() {
+		var err error
+		switch route.Name {
+		case "tasks":
+			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseTaskImplementation)
+		case "goals":
+			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseGoalPlanning)
+		}
+		if err != nil {
+			return fmt.Errorf("route %s: %w", route.Name, err)
 		}
 	}
 	if err := m.Outbox.Process(ctx); err != nil {
