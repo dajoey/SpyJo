@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -179,26 +181,11 @@ func cleanNotificationLine(value string) string {
 func validateDirectCompletionEvidence(document Document) error {
 	summary, ok := parseCompletionSummary(document)
 	if !ok || summary.Verdict != "completed" {
-		raw, isMap := document.FrontMatter["completion_summary"].(map[string]any)
-		if !isMap || raw == nil {
-			return errors.New("a valid completion_summary with verdict completed is required")
-		}
-		if v, _ := raw["verdict"].(string); v != "completed" {
-			return errors.New("completion_summary.verdict must be 'completed'")
-		}
-		if out, ok := raw["outcome"].(string); !ok || strings.TrimSpace(out) == "" {
-			return errors.New("completion_summary.outcome is required")
-		} else if utf8.RuneCountInString(cleanNotificationLine(out)) > notificationOutcomeRunes {
-			return errors.New("completion_summary.outcome exceeds maximum allowed length")
-		} else if containsAbsolutePath(cleanNotificationLine(out)) {
-			return errors.New("completion_summary.outcome contains forbidden host path")
-		}
-		if ev, ok := raw["evidence"].(string); ok && utf8.RuneCountInString(cleanNotificationLine(ev)) > notificationEvidenceRunes {
-			return errors.New("completion_summary.evidence exceeds maximum allowed length")
-		} else if ok && containsAbsolutePath(cleanNotificationLine(ev)) {
-			return errors.New("completion_summary.evidence contains forbidden host path")
-		}
-		return errors.New("a valid completion_summary with verdict completed is required")
+		// parseCompletionSummary only reports valid/invalid. Name the exact failing
+		// rule: a generic rejection makes the executor guess, and every wrong guess
+		// costs another full agent turn (observed 2026-09-14..16: ~60 rejections,
+		// one task bouncing 20+ times on the same summary).
+		return diagnoseCompletionSummary(document)
 	}
 	if summary.Evidence == "" {
 		return errors.New("completion_summary.evidence must record verification and the inspected boundary")
@@ -207,13 +194,111 @@ func validateDirectCompletionEvidence(document Document) error {
 		return errors.New("completion_summary.uncertainty must record remaining uncertainty")
 	}
 	updated, ok := timestampField(document, "updated_at")
-	if !ok || !summary.CompletedAt.Equal(updated) {
-		return errors.New("completion_summary.completed_at must exactly match updated_at")
+	if !ok {
+		return errors.New("updated_at must be an RFC 3339 UTC timestamp")
+	}
+	if !summary.CompletedAt.Equal(updated) {
+		return fmt.Errorf("completion_summary.completed_at %s must exactly match updated_at %s; set both to the same UTC time in the final front-matter edit", summary.CompletedAt.Format(time.RFC3339), updated.Format(time.RFC3339))
 	}
 	_, completedOffset := summary.CompletedAt.Zone()
 	_, updatedOffset := updated.Zone()
 	if completedOffset != 0 || updatedOffset != 0 {
 		return errors.New("completion_summary.completed_at and updated_at must be UTC")
+	}
+	return nil
+}
+
+// diagnoseCompletionSummary walks the parseCompletionSummary rules in order and
+// returns the first one a direct completion summary breaks.
+func diagnoseCompletionSummary(document Document) error {
+	value, exists := document.FrontMatter["completion_summary"]
+	if !exists {
+		if strings.Contains(document.Body, "completion_summary:") {
+			return errors.New("completion_summary is in the Markdown body; it must be a mapping inside the YAML front matter")
+		}
+		return errors.New("completion_summary is missing from the YAML front matter")
+	}
+	raw, isMap := value.(map[string]any)
+	if !isMap || raw == nil {
+		return fmt.Errorf("completion_summary must be a YAML mapping of verdict/outcome/evidence/uncertainty/completed_at, found %T", value)
+	}
+	keys := make([]string, 0, len(raw))
+	for key := range raw {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		switch key {
+		case "verdict", "outcome", "evidence", "uncertainty", "reviewed_at", "completed_at", "rework_count":
+		default:
+			return fmt.Errorf("completion_summary has unsupported key %q; allowed keys are verdict, outcome, evidence, uncertainty, completed_at", key)
+		}
+	}
+	checks := []struct {
+		key      string
+		limit    int
+		required bool
+	}{
+		{"verdict", 32, true},
+		{"outcome", notificationOutcomeRunes, true},
+		{"evidence", notificationEvidenceRunes, false},
+		{"uncertainty", notificationEvidenceRunes, false},
+	}
+	for _, check := range checks {
+		if err := diagnoseBoundedLine(raw, check.key, check.limit, check.required); err != nil {
+			return err
+		}
+	}
+	if verdict, _ := raw["verdict"].(string); cleanNotificationLine(verdict) != "completed" {
+		return fmt.Errorf("completion_summary.verdict must be \"completed\" for a direct done, found %q", cleanNotificationLine(verdict))
+	}
+	for _, key := range []string{"completed_at", "reviewed_at"} {
+		value, exists := raw[key]
+		if !exists {
+			if key == "completed_at" {
+				return errors.New("completion_summary.completed_at is required and must equal updated_at")
+			}
+			continue
+		}
+		switch typed := value.(type) {
+		case time.Time:
+		case string:
+			if _, err := time.Parse(time.RFC3339, strings.TrimSpace(typed)); err != nil {
+				return fmt.Errorf("completion_summary.%s %q is not an RFC 3339 timestamp like 2026-01-02T15:04:05Z", key, typed)
+			}
+		default:
+			return fmt.Errorf("completion_summary.%s must be an RFC 3339 timestamp, found %T", key, value)
+		}
+	}
+	if value, exists := raw["rework_count"]; exists {
+		if count, ok := exactNonnegativeInt(value); !ok || count > 100000 {
+			return errors.New("completion_summary.rework_count is code-managed; remove it")
+		}
+	}
+	return errors.New("a valid completion_summary with verdict completed is required")
+}
+
+func diagnoseBoundedLine(raw map[string]any, key string, limit int, required bool) error {
+	value, exists := raw[key]
+	if !exists {
+		if required {
+			return fmt.Errorf("completion_summary.%s is required", key)
+		}
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("completion_summary.%s must be a quoted string, found %T", key, value)
+	}
+	text = cleanNotificationLine(text)
+	if text == "" {
+		return fmt.Errorf("completion_summary.%s must not be empty", key)
+	}
+	if count := utf8.RuneCountInString(text); count > limit {
+		return fmt.Errorf("completion_summary.%s is %d characters; the limit is %d", key, count, limit)
+	}
+	if containsAbsolutePath(text) {
+		return fmt.Errorf("completion_summary.%s contains an absolute host path (/home/, /etc/, /var/, /opt/, /root/, /usr/, /tmp/, C:\\, D:\\ or a UNC share); name files by relative path instead", key)
 	}
 	return nil
 }

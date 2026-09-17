@@ -526,7 +526,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 	for _, test := range []struct {
 		name, target, want string
 		sameThread         bool
-	}{{"accept", "done", "done", false}, {"reject", "todo", "todo", false}, {"self-review", "done", "todo", true}} {
+	}{{"accept", "done", "done", false}, {"reject", "todo", "todo", false}, {"self-review", "done", "todo", true}, {"park accepted on human confirmation", "waiting", "waiting", false}, {"failed is not a review outcome", "failed", "todo", false}} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			if err := workspace.Init(root, false); err != nil {

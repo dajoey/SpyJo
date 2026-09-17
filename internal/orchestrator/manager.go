@@ -1016,15 +1016,22 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 		status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Independent review rejected automatically because the reviewer reused the implementation harness thread.")
 		return status, path, err
 	}
-	if status != "done" && status != "todo" {
+	// A review may also park the task in waiting: the submitted work is accepted
+	// but the acceptance criteria need a confirmation only a person can give
+	// (e.g. an in-game grade of a testing build). Returning it to todo instead
+	// burns a full implementation turn and an attempt whose only act is to park
+	// it again (observed 2026-09-17 on an attempt-capped task).
+	if status != "done" && status != "todo" && status != "waiting" {
 		var err error
-		status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Invalid task-review transition; review may only accept into done or return findings to todo.")
+		status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Invalid task-review transition; review may accept into done, return findings to todo, or park an accepted attempt in waiting on a human confirmation.")
 		if err != nil {
 			return status, path, err
 		}
 	}
-	m.finalizeTaskCompletionSummary(path, status)
-	if status == "done" {
+	if status != "waiting" {
+		m.finalizeTaskCompletionSummary(path, status)
+	}
+	if status == "done" || status == "waiting" {
 		if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 			return status, path, err
 		}
