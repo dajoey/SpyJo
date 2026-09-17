@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -581,6 +582,14 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 
 				// If matching worker agent exists in this workspace
 				if a.Name == expectedWorkerName && inWorkspace {
+					// A worker left over from different staffing (another runner kind)
+					// is retired so the conversation continues on the assigned runner.
+					if a.Agent != "" && a.Agent != model && a.AgentStatus != "working" {
+						if a.TabID != "" {
+							_ = exec.CommandContext(ctx, h.config.Command, "tab", "close", a.TabID).Run()
+						}
+						break
+					}
 					if a.AgentStatus == "blocked" {
 						_ = exec.CommandContext(ctx, h.config.Command, "agent", "send-keys", a.Name, "esc").Run()
 					}
@@ -673,6 +682,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	}
 	h.mu.Unlock()
 
+	cfg.Model = h.rosterModelForKey(key, cfg)
 	target, paneID, tabID, isDynamic, threadID, err := h.resolveTarget(ctx, key, cfg.Model, cfg.Cwd)
 	if err != nil {
 		return "", false, fmt.Errorf("herdr target resolution: %w", err)
@@ -803,6 +813,14 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	if agentKind == "opencode" || strings.HasPrefix(threadID, "ses_") {
 		if text, err := extractOpencodeMessage(threadID); err == nil && strings.TrimSpace(text) != "" {
 			finalText = text
+		}
+	}
+
+	if finalText == "" {
+		if path := transcriptPath(agentKind, threadID, cfg.Cwd); path != "" {
+			if text, err := extractTranscriptMessage(path); err == nil {
+				finalText = text
+			}
 		}
 	}
 
@@ -943,6 +961,77 @@ func cleanHerdrTerminalOutput(text string) string {
 }
 
 // extractOpencodeMessage queries OpenCode's local database for the latest assistant message in a session.
+var claudeProjectSlug = regexp.MustCompile(`[^A-Za-z0-9]`)
+
+// transcriptPath locates the runner's own JSONL session transcript, which holds
+// the exact final reply; a terminal scrape is only the last resort. Pi reports
+// the transcript path as its session; Claude Code reports a session UUID stored
+// under its per-directory project folder.
+func transcriptPath(agentKind, threadID, cwd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	switch {
+	case strings.HasSuffix(threadID, ".jsonl") && strings.HasPrefix(threadID, filepath.Join(home, ".pi")+string(filepath.Separator)):
+		return filepath.Clean(threadID)
+	case agentKind == "claude" && threadID != "" && !strings.ContainsAny(threadID, "/\\:"):
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(home, ".claude", "projects", claudeProjectSlug.ReplaceAllString(abs, "-"), threadID+".jsonl")
+	}
+	return ""
+}
+
+// extractTranscriptMessage returns the text of the last assistant message that
+// carries text. Pi and Claude Code share the {"message":{"role","content":[{"type":"text"}]}} line shape.
+func extractTranscriptMessage(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var last string
+	reader := bufio.NewReaderSize(file, 1<<20)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			var entry struct {
+				Message struct {
+					Role    string          `json:"role"`
+					Content json.RawMessage `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &entry) == nil && entry.Message.Role == "assistant" {
+				var blocks []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				}
+				var parts []string
+				if json.Unmarshal(entry.Message.Content, &blocks) == nil {
+					for _, block := range blocks {
+						if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+							parts = append(parts, strings.TrimSpace(block.Text))
+						}
+					}
+				}
+				if len(parts) > 0 {
+					last = strings.Join(parts, "\n\n")
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if last == "" {
+		return "", errors.New("no assistant text in transcript")
+	}
+	return last, nil
+}
+
 func extractOpencodeMessage(sessionID string) (string, error) {
 	if !strings.HasPrefix(sessionID, "ses_") {
 		return "", errors.New("not an opencode session")
@@ -1130,6 +1219,52 @@ func herdrStatusInterval(key string) time.Duration {
 		return 30 * time.Second
 	}
 	return 2 * time.Second
+}
+
+// rosterRoleForKey maps a harness session key to a roster role for turns that
+// the orchestrator's document routing does not cover.
+func rosterRoleForKey(key string) string {
+	key = strings.TrimSpace(key)
+	switch {
+	case strings.HasPrefix(key, "chat:"):
+		return "chat"
+	case strings.HasPrefix(key, "orchestrator:notification:"):
+		return "notification"
+	case key == "heartbeat" || key == "orchestrator:semantic-heartbeat":
+		return "heartbeat"
+	}
+	return ""
+}
+
+// rosterModelForKey applies roster staffing to chat, notification, and
+// heartbeat turns that arrive with the configured default model. An explicit
+// per-conversation model choice, a missing role, or any roster problem keeps
+// the requested model.
+func (h *Herdr) rosterModelForKey(key string, cfg HarnessConfig) string {
+	role := rosterRoleForKey(key)
+	if role == "" {
+		return cfg.Model
+	}
+	h.mu.Lock()
+	configured := strings.TrimSpace(h.config.Model)
+	h.mu.Unlock()
+	if requested := strings.TrimSpace(cfg.Model); requested != "" && requested != "default" && requested != configured {
+		return cfg.Model
+	}
+	stateDir := filepath.Join(cfg.Cwd, roster.StateDirName)
+	staffing, err := roster.Load(stateDir)
+	if err != nil || staffing == nil {
+		return cfg.Model
+	}
+	name := staffing.ForRole(role)
+	if name == "" {
+		return cfg.Model
+	}
+	assigned, err := staffing.Assign(stateDir, name, key, time.Now())
+	if assigned == "" || (err != nil && !staffing.Has(assigned)) {
+		return cfg.Model
+	}
+	return staffing.Model(assigned)
 }
 
 func isOrchestratorKey(key string) bool {
