@@ -174,3 +174,42 @@ func TestNotifyAtAsksOnceAndJoeyDecides(t *testing.T) {
 		t.Fatal("notify_at at or above daily_cap must fail")
 	}
 }
+
+func TestEscalationLadder(t *testing.T) {
+	base := `
+staff:
+  implementer: {runner: cursor}
+  architect: {runner: agy}
+  principal: {runner: claude}
+`
+	ladder, err := Load(write(t, base+`escalation:
+  - {after_attempt: 1, staff: architect}
+  - {after_attempt: 2, staff: principal}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		attempt int
+		pinned  bool
+		want    string
+	}{
+		{1, false, ""}, {2, false, "architect"}, {3, false, "principal"}, {9, false, "principal"},
+		{2, true, ""}, // a staff pin outranks the lower rung
+		{3, true, "principal"},
+	} {
+		if got := ladder.EscalationFor(c.attempt, c.pinned); got != c.want {
+			t.Fatalf("attempt %d pinned %v = %q, want %q", c.attempt, c.pinned, got, c.want)
+		}
+	}
+	single, err := Load(write(t, base+"escalation:\n  after_attempt: 2\n  staff: principal\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if single.EscalationFor(2, false) != "" || single.EscalationFor(3, true) != "principal" {
+		t.Fatal("single mapping form must keep its old behavior")
+	}
+	if _, err := Load(write(t, base+"escalation:\n  - {after_attempt: 2, staff: architect}\n  - {after_attempt: 2, staff: principal}\n")); err == nil {
+		t.Fatal("duplicate rung must fail")
+	}
+}

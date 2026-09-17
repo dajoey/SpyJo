@@ -47,10 +47,53 @@ type Escalation struct {
 	Staff        string `yaml:"staff"`
 }
 
+// Ladder is the attempt escalation: one mapping, or a list of rungs.
+type Ladder []Escalation
+
+func (l *Ladder) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.SequenceNode {
+		var rungs []Escalation
+		if err := node.Decode(&rungs); err != nil {
+			return err
+		}
+		*l = rungs
+		return nil
+	}
+	var one Escalation
+	if err := node.Decode(&one); err != nil {
+		return err
+	}
+	*l = Ladder{one}
+	return nil
+}
+
 type Roster struct {
 	Staff      map[string]Staff  `yaml:"staff"`
 	Roles      map[string]string `yaml:"roles"`
-	Escalation *Escalation       `yaml:"escalation,omitempty"`
+	Escalation Ladder            `yaml:"escalation,omitempty"`
+}
+
+// EscalationFor returns the staff for an implementation attempt: the rung with
+// the highest after_attempt below it. A task's own staff pin outranks every
+// rung except the top one, so a handed-off task reaches its specialist while a
+// task that keeps failing still reaches the top.
+func (r *Roster) EscalationFor(attempt int, pinned bool) string {
+	if r == nil {
+		return ""
+	}
+	best, top := -1, -1
+	for i, rung := range r.Escalation {
+		if top < 0 || rung.AfterAttempt > r.Escalation[top].AfterAttempt {
+			top = i
+		}
+		if attempt > rung.AfterAttempt && (best < 0 || rung.AfterAttempt > r.Escalation[best].AfterAttempt) {
+			best = i
+		}
+	}
+	if best < 0 || (pinned && best != top) {
+		return ""
+	}
+	return r.Escalation[best].Staff
 }
 
 // Path returns the roster file inside a workspace state directory.
@@ -114,12 +157,17 @@ func (r *Roster) validate() error {
 			return fmt.Errorf("role %s: staff %q is not defined", role, name)
 		}
 	}
-	if r.Escalation != nil {
-		if r.Escalation.AfterAttempt < 1 {
+	seen := map[int]bool{}
+	for _, rung := range r.Escalation {
+		if rung.AfterAttempt < 1 {
 			return errors.New("escalation.after_attempt must be at least 1")
 		}
-		if _, ok := r.Staff[r.Escalation.Staff]; !ok {
-			return fmt.Errorf("escalation: staff %q is not defined", r.Escalation.Staff)
+		if seen[rung.AfterAttempt] {
+			return fmt.Errorf("escalation: after_attempt %d is listed twice", rung.AfterAttempt)
+		}
+		seen[rung.AfterAttempt] = true
+		if _, ok := r.Staff[rung.Staff]; !ok {
+			return fmt.Errorf("escalation: staff %q is not defined", rung.Staff)
 		}
 	}
 	return nil

@@ -1627,9 +1627,7 @@ func (m *Manager) resolveRosterModel(route workflowRoute, lease Lease) (string, 
 			name = staffing.ForRole(phaseTaskReview)
 		}
 	case phaseTaskImplementation:
-		if staffing.Escalation != nil && numberValue(frontMatter["attempt"]) > staffing.Escalation.AfterAttempt {
-			name = staffing.Escalation.Staff
-		}
+		name = staffing.EscalationFor(int(numberValue(frontMatter["attempt"])), staffing.Has(text("staff")))
 		if name == "" {
 			if staff := text("staff"); staff != "" {
 				if staffing.Has(staff) {
