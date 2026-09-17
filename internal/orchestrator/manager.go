@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instructions"
+	"github.com/agent0ai/spynel/internal/roster"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
@@ -1583,6 +1585,86 @@ func (m *Manager) agentPrefix(phase string, settings config.Harness) string {
 }
 
 func (m *Manager) resolveTargetModel(route workflowRoute, lease Lease) string {
+	if model, ok := m.resolveRosterModel(route, lease); ok {
+		return model
+	}
+	return m.resolveLegacyTargetModel(route, lease)
+}
+
+// resolveRosterModel routes through the optional .spynel/roster.yaml. The file
+// is read fresh per dispatch so staffing edits apply at the next dispatch
+// boundary. Any roster problem is logged and legacy routing is used instead.
+func (m *Manager) resolveRosterModel(route workflowRoute, lease Lease) (string, bool) {
+	stateDir := m.Config.StatePath()
+	staffing, err := roster.Load(stateDir)
+	if err != nil {
+		m.log("roster ignored: " + err.Error())
+		return "", false
+	}
+	if staffing == nil {
+		return "", false
+	}
+	phase := normalizeLeasePhase(route.Name, lease.Phase)
+	if phase == "review" {
+		phase = phaseTaskReview
+	}
+	frontMatter := map[string]any{}
+	if doc, err := ReadDocument(lease.File); err == nil {
+		frontMatter = doc.FrontMatter
+	}
+	text := func(key string) string {
+		value, _ := frontMatter[key].(string)
+		return strings.TrimSpace(value)
+	}
+
+	name := ""
+	switch phase {
+	case phaseTaskReview:
+		if strings.EqualFold(text("risk"), "high") {
+			name = staffing.ForRole(phaseTaskReview + "_high_risk")
+		}
+		if name == "" {
+			name = staffing.ForRole(phaseTaskReview)
+		}
+	case phaseTaskImplementation:
+		if staffing.Escalation != nil && numberValue(frontMatter["attempt"]) > staffing.Escalation.AfterAttempt {
+			name = staffing.Escalation.Staff
+		}
+		if name == "" {
+			if staff := text("staff"); staff != "" {
+				if staffing.Has(staff) {
+					name = staff
+				} else {
+					m.log("roster: unknown staff " + strconv.Quote(staff) + " in " + filepath.Base(lease.File))
+				}
+			}
+		}
+		if name == "" && (text("agent") != "" || text("model") != "") {
+			return "", false // explicit legacy runner pin
+		}
+		if name == "" {
+			name = staffing.ForRole(phase)
+		}
+	default:
+		name = staffing.ForRole(phase)
+	}
+	if name == "" {
+		return "", false
+	}
+	assigned, err := staffing.Assign(stateDir, name, lease.SessionKey, time.Now())
+	if err != nil {
+		m.log("roster usage: " + err.Error())
+		if assigned == "" {
+			return "", false
+		}
+	}
+	if assigned != name {
+		m.log("roster: " + name + " is at its daily cap; " + filepath.Base(lease.File) + " goes to " + assigned)
+	}
+	return staffing.Model(assigned), true
+}
+
+func (m *Manager) resolveLegacyTargetModel(route workflowRoute, lease Lease) string {
 	harnessSettings := m.harnessSettings()
 	phase := normalizeLeasePhase(route.Name, lease.Phase)
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/roster"
 )
 
 // Herdr adapts the Herdr terminal workspace manager as a coding harness.
@@ -525,6 +526,16 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 		model = "opencode"
 	}
 
+	// Roster staff ("@name") expand to a runner kind plus launch arguments.
+	var agentArgs []string
+	if strings.HasPrefix(model, roster.StaffPrefix) {
+		kind, args, expandErr := roster.Expand(filepath.Join(cwd, roster.StateDirName), model)
+		if expandErr != nil {
+			return "", "", "", false, "", expandErr
+		}
+		model, agentArgs = kind, args
+	}
+
 	// 1. Direct explicit pane target (e.g. "w8:p2")
 	if strings.Contains(model, ":") {
 		return model, model, "", false, "", nil
@@ -619,6 +630,9 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 	_ = exec.CommandContext(ctx, h.config.Command, "agent", "rename", expectedWorkerName, "--clear").Run()
 
 	startArgs := []string{"agent", "start", expectedWorkerName, "--kind", model, "--pane", newPaneID, "--timeout", "45000"}
+	if len(agentArgs) > 0 {
+		startArgs = append(append(startArgs, "--"), agentArgs...)
+	}
 	startCmd := exec.CommandContext(ctx, h.config.Command, startArgs...)
 	startOut, startErr := startCmd.CombinedOutput()
 	if startErr != nil {
