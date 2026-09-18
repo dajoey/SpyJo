@@ -165,6 +165,8 @@ func (h *Herdr) Models(_ context.Context) ([]Model, error) {
 		{ID: "kimi", DisplayName: "Kimi", Description: "Dedicated Kimi CLI worker in Herdr pane", Efforts: allEfforts},
 		{ID: "hermes", DisplayName: "Hermes", Description: "Dedicated Hermes worker in Herdr pane", Efforts: allEfforts},
 		{ID: "agy", DisplayName: "Antigravity", Description: "Dedicated Antigravity CLI worker in Herdr pane", Efforts: allEfforts},
+		{ID: "pi", DisplayName: "Pi", Description: "Dedicated Pi worker in Herdr pane", Efforts: allEfforts},
+		{ID: "cursor", DisplayName: "Cursor", Description: "Dedicated Cursor worker in Herdr pane", Efforts: allEfforts},
 	}, nil
 }
 

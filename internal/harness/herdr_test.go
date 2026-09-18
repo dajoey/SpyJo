@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -42,6 +43,56 @@ func TestHerdrModels(t *testing.T) {
 	}
 	if !foundClaude {
 		t.Errorf("expected 'claude' model in Herdr models list")
+	}
+}
+
+func TestHerdrModelsOfferEveryRosterStaffRunner(t *testing.T) {
+	// Minimal roster shape matching .spynel/roster.yaml staff.runner pins.
+	const rosterYAML = `
+staff:
+  implementer:
+    runner: cursor
+  overflow:
+    runner: pi
+  researcher:
+    runner: agy
+  chat:
+    runner: hermes
+  planner:
+    runner: opencode
+  reviewer:
+    runner: claude
+`
+	offered := map[string]bool{}
+	h, err := NewHerdr(HarnessConfig{Name: "herdr"})
+	if err != nil {
+		t.Fatalf("NewHerdr failed: %v", err)
+	}
+	models, err := h.Models(context.Background())
+	if err != nil {
+		t.Fatalf("Models failed: %v", err)
+	}
+	for _, model := range models {
+		offered[model.ID] = true
+	}
+
+	required := []string{"cursor", "pi", "agy", "hermes", "opencode", "claude"}
+	for _, runner := range required {
+		if !offered[runner] {
+			t.Errorf("Models() missing roster staff runner %q", runner)
+		}
+	}
+
+	// Keep the fixture honest: every runner: line in it must be covered above.
+	for _, line := range strings.Split(rosterYAML, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "runner:") {
+			continue
+		}
+		runner := strings.TrimSpace(strings.TrimPrefix(line, "runner:"))
+		if runner == "" || !offered[runner] {
+			t.Errorf("roster fixture runner %q is not offered by Models()", runner)
+		}
 	}
 }
 
