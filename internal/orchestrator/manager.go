@@ -1539,8 +1539,21 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 		}
 		foreignOwner := lease.OwnerID != "" && lease.OwnerID != m.ownerID
 		staleThreshold := route.StaleAfter
-		if lease.State == "error" {
+		switch {
+		case lease.State == "error":
 			staleThreshold = 10 * time.Second
+		case lease.State == "awaiting_transition" && lease.RecoveryCount < quickAwaitingTransitionRecoveries:
+			// awaiting_transition means the provider turn already ended and the
+			// only thing outstanding is the agent-authored durable file move.
+			// reconcileTransitions observes that move on the very next scan, and
+			// this loop is only reached while the document still sits at its
+			// claimed path -- so a lease lingering here has a finished turn that
+			// moved nothing. That is what an interrupted restart leaves behind:
+			// the recovery turn finds no surviving worker, returns in seconds,
+			// and the lease then waits out route.StaleAfter (30 minutes for
+			// tasks) while the external runner watchdog fails the task forward
+			// at 10, charging it an attempt it never got a fair run at.
+			staleThreshold = awaitingTransitionStaleAfter
 		}
 		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < staleThreshold) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
 			continue

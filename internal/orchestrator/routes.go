@@ -24,6 +24,20 @@ func workflowRoutes() []workflowRoute {
 	}
 }
 
+// A lease parked in awaiting_transition is waiting only for the agent-authored
+// durable file move to become observable, which reconcileTransitions sees on the
+// next scan. route.StaleAfter is sized for a turn that is still running, so it is
+// far too slow for a turn that already ended without moving anything: the fleet's
+// external runner watchdog fails such a task forward after 10 minutes of stale
+// heartbeat, which costs the task an attempt it never got a fair run at. Recover
+// it in minutes instead, and bound the quick path -- a lease whose recovery turns
+// have ended empty this many times is a broken runner rather than an interrupted
+// one, and belongs to the ordinary stale path and its escalation.
+const (
+	awaitingTransitionStaleAfter      = 2 * time.Minute
+	quickAwaitingTransitionRecoveries = 3
+)
+
 func routeByName(name string) (workflowRoute, bool) {
 	for _, route := range workflowRoutes() {
 		if route.Name == name {

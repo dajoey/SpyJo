@@ -866,3 +866,133 @@ func TestGoalDoneRequiresReviewProof(t *testing.T) {
 		t.Fatalf("unproven goal completion was not rejected: %v", err)
 	}
 }
+
+// awaitingTransitionOrphan claims a task into working/ and parks a lease on it in
+// awaiting_transition, owned by this manager, as a finished provider turn that
+// never moved the document leaves it behind.
+func awaitingTransitionOrphan(t *testing.T, cfg config.Config, manager *Manager, title string, age time.Duration, recoveries int) string {
+	t.Helper()
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", title, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	working := filepath.Join(cfg.Resolve(route.Working), filepath.Base(task))
+	document, err := ClaimDocument(task, working, "working", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Add(-age)
+	lease := Lease{
+		ID: leaseID(route.Name+":"+phaseTaskImplementation, documentID(document)), ClaimID: "implementation",
+		DocumentType: "task", OwnerID: manager.ownerID, Route: route.Name, File: working,
+		SessionKey: "orchestrator:tasks:task_implementation:" + documentID(document) + ":1",
+		ThreadID:   "implementation-thread", State: "awaiting_transition", Phase: phaseTaskImplementation,
+		ClaimAttempt: 1, RecoveryCount: recoveries, StartedAt: stamp, HeartbeatAt: stamp,
+	}
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	return working
+}
+
+// A restart's recovery turn that finds no surviving worker returns in seconds and
+// parks its lease in awaiting_transition with the document untouched. Waiting out
+// route.StaleAfter there loses the race with the fleet's external runner watchdog,
+// which fails the task forward at 10 minutes and charges it an attempt.
+func TestEndedTurnThatMovedNothingRecoversBeforeTheExternalFailForward(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	working := awaitingTransitionOrphan(t, cfg, manager, "recover a turn that ended without moving its task", 3*time.Minute, 0)
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+
+	if fake.calls != 1 {
+		t.Fatalf("ended-turn orphan dispatches = %d, want 1", fake.calls)
+	}
+	document, err := ReadDocument(working)
+	if err != nil {
+		t.Fatalf("task left its claimed directory: %v", err)
+	}
+	if document.FrontMatter["attempt"] != 1 {
+		t.Fatalf("recovery consumed an attempt: %#v", document.FrontMatter)
+	}
+	if !strings.Contains(document.Body, "Spynel started recovery attempt 1 for task implementation") {
+		t.Fatalf("recovery was not journaled: %q", document.Body)
+	}
+	base := filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source))
+	for _, status := range []string{"failed", "todo"} {
+		if _, err := os.Stat(filepath.Join(base, status, filepath.Base(working))); err == nil {
+			t.Fatalf("restart orphan passed through %s/", status)
+		}
+	}
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 1 || leases[0].RecoveryCount != 1 {
+		t.Fatalf("recovered lease = %#v, %v", leases, err)
+	}
+	// The external watchdog reads this heartbeat and fails the task forward when
+	// it goes stale, so recovery has to refresh it, not merely re-dispatch.
+	if age := time.Since(leases[0].HeartbeatAt); age > time.Minute {
+		t.Fatalf("recovery left the heartbeat stale by %s", age)
+	}
+}
+
+// The quick path only helps if every quick recovery lands inside the window the
+// fleet's runner watchdog gives a task before it fails it forward.
+func TestQuickRecoveryFitsInsideTheExternalFailForwardWindow(t *testing.T) {
+	const externalFailForward = 10 * time.Minute
+	if span := awaitingTransitionStaleAfter * quickAwaitingTransitionRecoveries; span >= externalFailForward {
+		t.Fatalf("quick recovery spans %s, which does not fit inside the %s external fail-forward window", span, externalFailForward)
+	}
+}
+
+// The quick path is bounded: turns that keep ending empty are a broken runner, not
+// an interrupted one, so recovery hands them back to the ordinary stale threshold
+// instead of re-dispatching every couple of minutes forever.
+func TestRepeatedlyEmptyTurnsStopUsingTheQuickRecoveryPath(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	awaitingTransitionOrphan(t, cfg, manager, "stop retrying a runner that never starts", 3*time.Minute, quickAwaitingTransitionRecoveries)
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+
+	if fake.calls != 0 {
+		t.Fatalf("exhausted quick recovery still dispatched: calls=%d", fake.calls)
+	}
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 1 || leases[0].RecoveryCount != quickAwaitingTransitionRecoveries {
+		t.Fatalf("lease was disturbed past the quick-recovery bound: %#v, %v", leases, err)
+	}
+}
+
+// A turn that is still running owns its lease no matter how long it has been quiet:
+// an in-flight dispatch or a live harness session is never re-dispatched underneath.
+func TestLiveSessionKeepsItsAwaitingTransitionLease(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	working := awaitingTransitionOrphan(t, cfg, manager, "leave a live session alone", 3*time.Minute, 0)
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("fixture leases = %#v, %v", leases, err)
+	}
+	fake.active[leases[0].SessionKey] = true
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+
+	if fake.calls != 0 {
+		t.Fatalf("live session was re-dispatched: calls=%d", fake.calls)
+	}
+	if _, err := ReadDocument(working); err != nil {
+		t.Fatalf("live session lost its task: %v", err)
+	}
+	after, err := manager.loadLeases()
+	if err != nil || len(after) != 1 || after[0].RecoveryCount != 0 {
+		t.Fatalf("live session lease was disturbed: %#v, %v", after, err)
+	}
+}
