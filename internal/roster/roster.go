@@ -39,7 +39,10 @@ type Staff struct {
 	// DailyCap halts the staff for the day unless Joey answered "continue".
 	DailyCap int    `yaml:"daily_cap,omitempty"`
 	Fallback string `yaml:"fallback,omitempty"`
-	Note     string `yaml:"note,omitempty"`
+	// NoEscalate keeps a pinned task on this staff past the top ladder rung
+	// instead of promoting it. Opt-in for private-domain seats.
+	NoEscalate bool   `yaml:"no_escalate,omitempty"`
+	Note       string `yaml:"note,omitempty"`
 }
 
 type Escalation struct {
