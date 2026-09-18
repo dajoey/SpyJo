@@ -1,6 +1,7 @@
 package roster
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,6 +104,72 @@ func TestAssignCapsCountOncePerSessionAndResetDaily(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "runtime", usageFileName)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A mid-day roster reseat must reach a conversation that already ran today.
+// Before 2026-09-18 the Seen map was consulted before the role was resolved,
+// so the live Telegram chat kept the staff it first got that day and ignored
+// Joey's reseat until midnight.
+func TestAssignFollowsAMidDayReseat(t *testing.T) {
+	dir := write(t, sample)
+	r, _ := Load(dir)
+	day := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	key := "chat:telegram:TG-1"
+
+	if got, err := r.Assign(dir, "thinker", key, day); err != nil || got != "thinker" {
+		t.Fatalf("first assign = %q, %v", got, err)
+	}
+	// The role is reseated to implementer; the same session must follow.
+	if got, err := r.Assign(dir, "implementer", key, day); err != nil || got != "implementer" {
+		t.Fatalf("after reseat = %q, %v; want implementer", got, err)
+	}
+	// And it stays put while the roster keeps naming that staff.
+	if got, _ := r.Assign(dir, "implementer", key, day); got != "implementer" {
+		t.Fatalf("stickiness lost: %q", got)
+	}
+}
+
+// A session already moved to a fallback stays there while the roster still
+// routes its role through that fallback, so a tripped cap never yanks it back
+// and never double-counts it.
+func TestAssignKeepsASessionOnItsFallback(t *testing.T) {
+	dir := write(t, sample)
+	r, _ := Load(dir)
+	day := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+
+	for _, k := range []string{"s1", "s2"} {
+		if got, _ := r.Assign(dir, "principal", k, day); got != "principal" {
+			t.Fatalf("%s = %q", k, got)
+		}
+	}
+	// Cap of 2 is now spent, so a new session falls back.
+	if got, _ := r.Assign(dir, "principal", "s3", day); got != "thinker" {
+		t.Fatalf("s3 = %q, want thinker", got)
+	}
+	// s3 repeats: principal still falls back to thinker, so s3 is unchanged
+	// and is not counted a second time.
+	before := readCount(t, dir, "thinker")
+	if got, _ := r.Assign(dir, "principal", "s3", day); got != "thinker" {
+		t.Fatalf("s3 repeat = %q", got)
+	}
+	if after := readCount(t, dir, "thinker"); after != before {
+		t.Fatalf("thinker double-counted: %d -> %d", before, after)
+	}
+}
+
+func readCount(t *testing.T, dir, staff string) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "runtime", usageFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var u struct {
+		Counts map[string]int `json:"counts"`
+	}
+	if err := json.Unmarshal(data, &u); err != nil {
+		t.Fatal(err)
+	}
+	return u.Counts[staff]
 }
 
 const notifySample = `

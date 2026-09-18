@@ -258,6 +258,25 @@ var usageMu sync.Mutex
 // is itself capped, so work is never left without a runner. Reaching notify_at
 // files one ask for Joey and changes no routing; his "continue" lifts daily_cap
 // for the day and his "stop" halts the staff at once.
+// routesThrough reports whether staff `to` is `from` itself or is reachable
+// from it by following fallback links -- i.e. whether a session already
+// assigned to `to` is still consistent with the roster naming `from` for its
+// role.
+func (r *Roster) routesThrough(from, to string) bool {
+	cur := from
+	for hop := 0; hop <= maxFallback; hop++ {
+		if cur == to {
+			return true
+		}
+		s, ok := r.Staff[cur]
+		if !ok || s.Fallback == "" {
+			return false
+		}
+		cur = s.Fallback
+	}
+	return false
+}
+
 func (r *Roster) Assign(stateDir, name, sessionKey string, now time.Time) (string, error) {
 	if !r.Has(name) {
 		return "", fmt.Errorf("roster staff %q is not defined", name)
@@ -274,7 +293,15 @@ func (r *Roster) Assign(stateDir, name, sessionKey string, now time.Time) (strin
 	if u.Date != today || u.Counts == nil || u.Seen == nil {
 		u = usage{Date: today, Counts: map[string]int{}, Seen: map[string]string{}}
 	}
-	if prior, ok := u.Seen[sessionKey]; ok && sessionKey != "" && r.Has(prior) {
+	// Seen exists so one session counts once against daily_cap. It must not
+	// also pin routing across a roster edit: roster.yaml promises "edit, save,
+	// done (no restart)", and before 2026-09-18 this check accepted any prior
+	// staff, so a conversation already seen that day kept the staff it first
+	// got and silently ignored a mid-day reseat until midnight. Accept the
+	// prior choice only while the roster still routes this role through it --
+	// a tripped daily_cap still leaves a running session where it is, but a
+	// reseat changes `name` and lets the session move.
+	if prior, ok := u.Seen[sessionKey]; ok && sessionKey != "" && r.Has(prior) && r.routesThrough(name, prior) {
 		return prior, nil
 	}
 
