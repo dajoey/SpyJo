@@ -19,4 +19,5 @@ Direct child DOX files:
 
 | Child | Scope |
 | --- | --- |
+| [spyjo/AGENTS.md](spyjo/AGENTS.md) | `spyjo` launcher alias over the shared CLI entry point. |
 | [spynel/AGENTS.md](spynel/AGENTS.md) | Executable process composition. |
