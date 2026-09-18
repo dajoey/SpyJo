@@ -755,6 +755,10 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 
 	// Execute prompt with --wait
 	// Default timeout 15 minutes (900000 ms)
+	// promptStart bounds the transcript read below to THIS turn: without it the
+	// reader returns the newest assistant text anywhere in the file, so a turn
+	// that errored replays the previous answer as if it were fresh.
+	promptStart := time.Now()
 	promptCmd := exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
 	turn.cmd = promptCmd
 	promptOut, promptErr := promptCmd.CombinedOutput()
@@ -818,7 +822,12 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 
 	if finalText == "" {
 		if path := transcriptPath(agentKind, threadID, cfg.Cwd); path != "" {
-			if text, err := extractTranscriptMessage(path); err == nil {
+			text, err := extractTranscriptMessage(path, promptStart)
+			var turnErr *transcriptTurnError
+			if errors.As(err, &turnErr) {
+				return threadID, false, fmt.Errorf("runner turn failed: %s", turnErr.Detail)
+			}
+			if err == nil {
 				finalText = text
 			}
 		}
@@ -904,11 +913,11 @@ var (
 		regexp.MustCompile(`(?m)^\s*▄▄[↵\^].*$`),
 		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
 	}
-	herdrThoughtPattern   = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
-	hermesBoxPattern      = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
-	hermesReasoningBox    = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
-	kimiInputBoxPattern   = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
-	agyInputBoxPattern    = regexp.MustCompile(`(?s)╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯`)
+	herdrThoughtPattern = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
+	hermesBoxPattern    = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
+	hermesReasoningBox  = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
+	kimiInputBoxPattern = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
+	agyInputBoxPattern  = regexp.MustCompile(`(?s)╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯`)
 )
 
 // cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
@@ -985,40 +994,71 @@ func transcriptPath(agentKind, threadID, cwd string) string {
 	return ""
 }
 
+// transcriptTurnError reports that the runner produced a turn for THIS prompt
+// but that turn carried no usable text -- a provider error, a refusal, an empty
+// completion. It exists so the caller fails the turn loudly instead of serving
+// an older reply: on 2026-09-18 a Venice 402 on the chat seat made SpyJo answer
+// three unrelated questions with the same stale paragraph, twice verbatim.
+type transcriptTurnError struct {
+	Detail string
+}
+
+func (e *transcriptTurnError) Error() string { return e.Detail }
+
 // extractTranscriptMessage returns the text of the last assistant message that
-// carries text. Pi and Claude Code share the {"message":{"role","content":[{"type":"text"}]}} line shape.
-func extractTranscriptMessage(path string) (string, error) {
+// carries text AND belongs to the turn started at or after since. Pi and Claude
+// Code share the {"message":{"role","content":[{"type":"text"}]}} line shape and
+// both stamp each line with a top-level RFC3339 timestamp.
+//
+// Messages older than since are never returned: they belong to a previous turn.
+func extractTranscriptMessage(path string, since time.Time) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 	var last string
+	var failure string
+	var sawTurn bool
 	reader := bufio.NewReaderSize(file, 1<<20)
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			var entry struct {
-				Message struct {
-					Role    string          `json:"role"`
-					Content json.RawMessage `json:"content"`
+				Timestamp string `json:"timestamp"`
+				Message   struct {
+					Role         string          `json:"role"`
+					Content      json.RawMessage `json:"content"`
+					StopReason   string          `json:"stopReason"`
+					ErrorMessage string          `json:"errorMessage"`
 				} `json:"message"`
 			}
 			if json.Unmarshal(line, &entry) == nil && entry.Message.Role == "assistant" {
-				var blocks []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				}
-				var parts []string
-				if json.Unmarshal(entry.Message.Content, &blocks) == nil {
-					for _, block := range blocks {
-						if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
-							parts = append(parts, strings.TrimSpace(block.Text))
+				// Drop anything written before this turn's prompt was sent.
+				stamp, stampErr := time.Parse(time.RFC3339, entry.Timestamp)
+				inTurn := stampErr == nil && !stamp.Before(since)
+				if inTurn {
+					sawTurn = true
+					var blocks []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					}
+					var parts []string
+					if json.Unmarshal(entry.Message.Content, &blocks) == nil {
+						for _, block := range blocks {
+							if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+								parts = append(parts, strings.TrimSpace(block.Text))
+							}
 						}
 					}
-				}
-				if len(parts) > 0 {
-					last = strings.Join(parts, "\n\n")
+					if len(parts) > 0 {
+						last = strings.Join(parts, "\n\n")
+						failure = ""
+					} else if detail := strings.TrimSpace(entry.Message.ErrorMessage); detail != "" {
+						failure = detail
+					} else if entry.Message.StopReason == "error" {
+						failure = "runner reported an error with no message"
+					}
 				}
 			}
 		}
@@ -1026,10 +1066,16 @@ func extractTranscriptMessage(path string) (string, error) {
 			break
 		}
 	}
-	if last == "" {
-		return "", errors.New("no assistant text in transcript")
+	if last != "" {
+		return last, nil
 	}
-	return last, nil
+	if failure != "" {
+		return "", &transcriptTurnError{Detail: failure}
+	}
+	if sawTurn {
+		return "", &transcriptTurnError{Detail: "runner produced an empty reply"}
+	}
+	return "", errors.New("no assistant text in transcript for this turn")
 }
 
 func extractOpencodeMessage(sessionID string) (string, error) {
@@ -1396,4 +1442,3 @@ func (h *Herdr) sweepOrphanedWorkers(ctx context.Context) {
 		_ = exec.Command(h.config.Command, "agent", "rename", a.Name, "--clear").Run()
 	}
 }
-
