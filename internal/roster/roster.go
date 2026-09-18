@@ -74,6 +74,21 @@ type Roster struct {
 	Staff      map[string]Staff  `yaml:"staff"`
 	Roles      map[string]string `yaml:"roles"`
 	Escalation Ladder            `yaml:"escalation,omitempty"`
+	// Routing is the machine-readable domain routing table (Joey 2026-09-18:
+	// "routing is by work type, and the filer sets it — not a classifier, not
+	// Joey"). Each entry names a work type; filers stamp front matter
+	// `staff:` from it. An empty Staff means omit the pin and fall through to
+	// the role default. A non-empty HeldUntil marks a HELD domain: Staff is
+	// the current fallback and HeldUntil is the unblock condition.
+	Routing []RouteEntry `yaml:"routing,omitempty"`
+}
+
+// RouteEntry is one work-type -> seat row. HeldUntil set means HELD.
+type RouteEntry struct {
+	Domain    string `yaml:"domain"`
+	Staff     string `yaml:"staff,omitempty"`
+	HeldUntil string `yaml:"held_until,omitempty"`
+	Note      string `yaml:"note,omitempty"`
 }
 
 // EscalationFor returns the staff for an implementation attempt: the rung with
@@ -171,6 +186,29 @@ func (r *Roster) validate() error {
 		seen[rung.AfterAttempt] = true
 		if _, ok := r.Staff[rung.Staff]; !ok {
 			return fmt.Errorf("escalation: staff %q is not defined", rung.Staff)
+		}
+	}
+	for i, entry := range r.Routing {
+		if strings.TrimSpace(entry.Domain) == "" {
+			return fmt.Errorf("routing[%d]: domain must not be empty", i)
+		}
+		for j := 0; j < i; j++ {
+			if r.Routing[j].Domain == entry.Domain {
+				return fmt.Errorf("routing: domain %q is listed twice", entry.Domain)
+			}
+		}
+		if entry.Staff != "" {
+			if _, ok := r.Staff[entry.Staff]; !ok {
+				return fmt.Errorf("routing %q: staff %q is not defined", entry.Domain, entry.Staff)
+			}
+		}
+		if entry.HeldUntil != "" && entry.Staff == "" {
+			return fmt.Errorf("routing %q: a held domain must name its fallback staff", entry.Domain)
+		}
+		for _, field := range []string{entry.Domain, entry.Staff, entry.HeldUntil, entry.Note} {
+			if strings.ContainsAny(field, "\n\r\x00") {
+				return fmt.Errorf("routing %q: fields must be single-line", entry.Domain)
+			}
 		}
 	}
 	return nil
