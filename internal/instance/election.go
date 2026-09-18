@@ -53,7 +53,17 @@ type Election struct {
 	pid              int
 	now              func() time.Time
 	environmentID    string
+	// exeDeleted reports whether a process image was replaced on disk while
+	// the process runs (Linux `/proc/<pid>/exe` reading `... (deleted)`).
+	// It is a field so tests can simulate a binary swap without one.
+	exeDeleted func(int) bool
 }
+
+// ErrExecutableReplaced reports that this process's own executable was
+// replaced on disk while it runs. Its own lease reads permanently stale to
+// itself, so acquiring or renewing would only churn; the caller must stop and
+// let the service manager restart the process from the new binary.
+var ErrExecutableReplaced = errors.New("process executable was replaced while running")
 
 type releaseFence struct {
 	ReleasedAt time.Time `json:"released_at"`
@@ -87,11 +97,23 @@ func NewWithEnvironmentID(stateDirectory, environmentID string) (*Election, erro
 		pid:              os.Getpid(),
 		now:              func() time.Time { return time.Now().UTC() },
 		environmentID:    environmentID,
+		exeDeleted:       isProcessExeDeleted,
 	}, nil
 }
 
 func (e *Election) ID() string            { return e.id }
 func (e *Election) EnvironmentID() string { return e.environmentID }
+
+// OwnExecutableReplaced reports whether this process's executable file was
+// replaced on disk after the process started. A replaced process must exit so
+// the service manager restarts it; it must never acquire, renew, or churn the
+// primary lease in the meantime.
+func (e *Election) OwnExecutableReplaced() bool {
+	if e.exeDeleted == nil {
+		return isProcessExeDeleted(e.pid)
+	}
+	return e.exeDeleted(e.pid)
+}
 
 // EnvironmentID returns a non-secret digest of a private random token stored
 // in the operating system's per-user configuration directory. This models the
@@ -167,10 +189,15 @@ func (e *Election) NewToken() (string, error) {
 
 // TryAcquire publishes this process as owner only when there is no healthy
 // owner. The cross-process mutex makes the stale check and replacement one
-// indivisible decision among all contenders.
+// indivisible decision among all contenders. A process whose own executable
+// was replaced fails with ErrExecutableReplaced instead of acquiring: its
+// lease would read permanently stale to itself and only churn.
 func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 	if endpoint == "" || token == "" {
 		return Lease{}, false, errors.New("instance endpoint and token are required")
+	}
+	if e.OwnExecutableReplaced() {
+		return Lease{}, false, ErrExecutableReplaced
 	}
 	var result Lease
 	var acquired bool
@@ -208,8 +235,14 @@ func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 
 // Renew refreshes an ownership term only if both its process identity and
 // secret token are still current. A resumed stale process therefore observes
-// the winner of a takeover instead of overwriting it.
+// the winner of a takeover instead of overwriting it. A process whose own
+// executable was replaced fails with ErrExecutableReplaced instead of
+// renewing, so the caller exits rather than releasing and reacquiring in a
+// loop.
 func (e *Election) Renew(token string) (Lease, bool, error) {
+	if e.OwnExecutableReplaced() {
+		return Lease{}, false, ErrExecutableReplaced
+	}
 	var result Lease
 	var owned bool
 	err := e.withLock(func() error {

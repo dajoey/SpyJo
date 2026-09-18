@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -45,6 +46,27 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 	defer ticker.Stop()
 	var term *primaryTerm
 	var nextHeartbeat time.Time
+	// consecutiveFailures counts back-to-back primary-acquisition failures
+	// that would otherwise retry every second. Each deferral is logged once;
+	// ticks inside the interval stay silent so a wedged contender cannot spam
+	// runtime session files or the log.
+	consecutiveFailures := 0
+	var nextAttempt time.Time
+	logLine := func(format string, args ...any) {
+		if len(options) > 0 && options[0].Log != nil {
+			fmt.Fprintf(options[0].Log, "spyjo: "+format+"\n", args...)
+		}
+	}
+	deferFailure := func(now time.Time, format string, args ...any) error {
+		consecutiveFailures++
+		delay := 5 * time.Second << (consecutiveFailures - 1)
+		if delay > time.Minute || delay <= 0 {
+			delay = time.Minute
+		}
+		nextAttempt = now.Add(delay)
+		logLine(format+" (retrying in %s)", append(args, delay)...)
+		return nil
+	}
 	defer func() {
 		if term != nil {
 			term.stop()
@@ -67,9 +89,19 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			}
 			_, owned, err := election.Renew(term.token)
 			if err != nil {
+				if errors.Is(err, instance.ErrExecutableReplaced) {
+					term.stop()
+					term = nil
+					return executableReplacedError()
+				}
 				term.service.Runtime.LogEvent("error", "instance", "lease_renew_failed", "Renew primary lease: "+err.Error())
 			}
 			if err != nil || !owned {
+				if election.OwnExecutableReplaced() {
+					term.stop()
+					term = nil
+					return executableReplacedError()
+				}
 				term.stop()
 				term = nil
 				return nil
@@ -78,11 +110,24 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			return nil
 		}
 
+		// A binary swap under this process leaves its own lease permanently
+		// stale to itself. Acquiring again would only churn, so fail loudly:
+		// the process exits non-zero and the service manager restarts it from
+		// the new binary within seconds.
+		if election.OwnExecutableReplaced() {
+			return executableReplacedError()
+		}
+		if !nextAttempt.IsZero() && now.Before(nextAttempt) {
+			return nil
+		}
+
 		current, err := election.Current()
 		if err == nil && !election.CanTakeOver(current) {
 			if len(options) > 0 && options[0].Socket != "" {
 				return errors.New("--socket requires a new primary; an existing primary already owns this workspace")
 			}
+			consecutiveFailures = 0
+			nextAttempt = time.Time{}
 			return nil
 		}
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -95,19 +140,31 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			return err
 		}
 		_, acquired, err := election.TryAcquire(listener.Addr().String(), token)
-		if err != nil || !acquired {
+		if err != nil {
 			listener.Close()
+			if errors.Is(err, instance.ErrExecutableReplaced) {
+				return executableReplacedError()
+			}
 			return err
+		}
+		if !acquired {
+			listener.Close()
+			return deferFailure(now, "primary lease held by another instance")
 		}
 		term, err = startPrimaryTerm(ctx, cfg, version, election, listener, token, restart, update, options...)
 		if err != nil {
 			_ = election.Release(token)
 			listener.Close()
 			if errors.Is(err, errOwnershipLost) {
-				return nil
+				return deferFailure(now, "lost primary ownership during startup")
+			}
+			if errors.Is(err, instance.ErrExecutableReplaced) {
+				return executableReplacedError()
 			}
 			return err
 		}
+		consecutiveFailures = 0
+		nextAttempt = time.Time{}
 		nextHeartbeat = time.Now().Add(instance.HeartbeatInterval)
 		return nil
 	}
@@ -184,6 +241,9 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		cancel()
 		if renewErr != nil {
 			return nil, renewErr
+		}
+		if election.OwnExecutableReplaced() {
+			return nil, instance.ErrExecutableReplaced
 		}
 		return nil, errOwnershipLost
 	}
@@ -296,6 +356,15 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		return errOwnershipLost
 	}
 	return stopErr
+}
+
+// executableReplacedError fails the election loop loudly when this process's
+// own binary was swapped underneath it. The error propagates out of
+// runOwnerElection, the process exits non-zero, and the service manager
+// restarts it from the new binary. Main also records the failure in the
+// workspace runtime log, so the cause is visible in both places.
+func executableReplacedError() error {
+	return fmt.Errorf("local executable was replaced while running; exiting so the service manager restarts this instance: %w", instance.ErrExecutableReplaced)
 }
 
 func errorText(err error) string {

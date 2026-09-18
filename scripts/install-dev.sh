@@ -81,6 +81,26 @@ mv -f "$staged" "$target"
 ln -sf "$target" "$alias_target"
 trap - EXIT HUP INT TERM
 
+# Replacing the executable under a running instance leaves its /proc/<pid>/exe
+# marked (deleted), which wedges election in a silent acquire/release loop.
+# Restart any active instance so it re-executes from the new binary.
+# Best-effort: a failed or unavailable restart never fails the install.
+restarted_units=""
+if command -v systemctl >/dev/null 2>&1; then
+  for unit in $(systemctl --user list-units --type=service --state=running 'spynel-*' --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true); do
+    case "$unit" in
+      spynel-*.service)
+        if systemctl --user restart "$unit" 2>/dev/null; then
+          restarted_units="$restarted_units $unit"
+        fi
+        ;;
+    esac
+  done
+fi
+if [ -n "$restarted_units" ]; then
+  echo "Restarted running instance(s):$restarted_units"
+fi
+
 path_contains() {
   previous_ifs=$IFS
   IFS=:

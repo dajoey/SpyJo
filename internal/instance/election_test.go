@@ -697,3 +697,47 @@ func TestDeadPIDLeaseIsImmediatelyStale(t *testing.T) {
 		t.Fatal("expected dead PID lease to be stale")
 	}
 }
+
+func TestReplacedExecutableRefusesAcquireAndRenew(t *testing.T) {
+	state := t.TempDir()
+	owner, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return now }
+	token, _ := owner.NewToken()
+	lease, acquired, err := owner.TryAcquire("127.0.0.1:10001", token)
+	if err != nil || !acquired {
+		t.Fatalf("owner acquire = %#v, %t, %v", lease, acquired, err)
+	}
+	if _, owned, err := owner.Renew(token); err != nil || !owned {
+		t.Fatalf("healthy renew = %t, %v", owned, err)
+	}
+
+	// Simulate a binary swap under the running process: its own executable
+	// now reads "(deleted)", so its own lease is permanently stale to
+	// itself. The instance must refuse to renew or reacquire instead of
+	// releasing and reacquiring in a loop.
+	owner.exeDeleted = func(int) bool { return true }
+	if !owner.OwnExecutableReplaced() {
+		t.Fatal("expected replaced executable to be reported")
+	}
+	if _, owned, err := owner.Renew(token); !errors.Is(err, ErrExecutableReplaced) || owned {
+		t.Fatalf("replaced renew = %t, %v", owned, err)
+	}
+	replacementToken, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", replacementToken); !errors.Is(err, ErrExecutableReplaced) || acquired {
+		t.Fatalf("replaced reacquire = %t, %v", acquired, err)
+	}
+
+	// The refusal must not disturb the published term: no release happened,
+	// so the lease on disk still belongs to this instance.
+	current, err := owner.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.InstanceID != lease.InstanceID || current.Token != token {
+		t.Fatalf("replaced instance disturbed its own lease: %#v, want %#v", current, lease)
+	}
+}
