@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 )
@@ -97,6 +98,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	mux.HandleFunc("GET /v1/events", s.authorize(s.events))
 	mux.HandleFunc("GET /v1/conversation", s.authorize(s.conversation))
 	mux.HandleFunc("POST /v1/screen-action", s.authorize(s.screenAction))
+	mux.HandleFunc("GET /v1/settings", s.authorize(s.listSettings))
 	mux.HandleFunc("POST /v1/settings", s.authorize(s.settings))
 	mux.HandleFunc("POST /v1/run-once", s.authorize(s.runOnce))
 	mux.HandleFunc("POST /v1/notify", s.authorize(s.notify))
@@ -395,6 +397,27 @@ func (s *Server) screenAction(response http.ResponseWriter, request *http.Reques
 		return
 	}
 	writeJSON(response, http.StatusOK, screenResponse{Screen: screen})
+}
+
+func (s *Server) listSettings(response http.ResponseWriter, request *http.Request) {
+	settings := config.Settings(s.Service.Settings.Snapshot())
+	items := make([]map[string]any, 0, len(settings))
+	for _, setting := range settings {
+		item := map[string]any{
+			"key":         setting.Key,
+			"section":     setting.Section,
+			"description": setting.Description,
+			"value":       setting.Value,
+			"secret":      setting.Secret,
+			"restart":     setting.Restart,
+			"advanced":    setting.Advanced,
+		}
+		if len(setting.Choices) > 0 {
+			item["choices"] = setting.Choices
+		}
+		items = append(items, item)
+	}
+	writeJSON(response, http.StatusOK, map[string]any{"settings": items})
 }
 
 func (s *Server) settings(response http.ResponseWriter, request *http.Request) {
