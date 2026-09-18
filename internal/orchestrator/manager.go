@@ -761,6 +761,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 		// Admission and asynchronous events must not overwrite each other's
 		// lease state (especially a terminal event racing Send's return).
 		var lifecycleMu sync.Mutex
+		var terminalSeen bool
 		emit := func(event core.Event) {
 			lifecycleMu.Lock()
 			defer lifecycleMu.Unlock()
@@ -768,6 +769,9 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				return
 			}
 			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+			if terminal {
+				terminalSeen = true
+			}
 			if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, event)
 			}
@@ -809,12 +813,31 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 		targetModel := m.resolveTargetModel(route, lease)
 		var threadID string
 		var steered bool
-		if ms, ok := m.Harness.(interface {
-			SendWithModel(context.Context, string, string, string, core.Emit) (string, bool, error)
-		}); ok && targetModel != "" {
-			threadID, steered, err = ms.SendWithModel(ctx, lease.SessionKey, prompt, targetModel, emit)
-		} else {
-			threadID, steered, err = m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+		for sendAttempt := 0; ; sendAttempt++ {
+			if ms, ok := m.Harness.(interface {
+				SendWithModel(context.Context, string, string, string, core.Emit) (string, bool, error)
+			}); ok && targetModel != "" {
+				threadID, steered, err = ms.SendWithModel(ctx, lease.SessionKey, prompt, targetModel, emit)
+			} else {
+				threadID, steered, err = m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+			}
+			if err == nil || sendAttempt >= 1 {
+				break
+			}
+			// A provider refusing work right now (backend overload, "please
+			// retry") is not a failed worker: retry once in place so it costs
+			// neither a re-claim (attempt++ and an escalation rung) nor a
+			// fallback seat. A dead runner (signal/exit-code errors) never
+			// matches here and fails over immediately, and a lease whose
+			// failed attempt already reached a terminal event belongs to
+			// transition reconciliation, not to a retry.
+			lifecycleMu.Lock()
+			eligible := !terminalSeen && transientProviderError(err)
+			lifecycleMu.Unlock()
+			if !eligible {
+				break
+			}
+			m.log(fmt.Sprintf("transient provider refusal on %s, retrying once in place: %v", lease.File, err))
 		}
 		lifecycleMu.Lock()
 		defer lifecycleMu.Unlock()
@@ -2024,6 +2047,19 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.controlCancelled[leaseID] > 0
+}
+
+// transientProviderError reports whether a harness send error is a provider
+// refusing work right now (backend overload, "please retry") rather than a
+// dead or misbehaving runner. Only the harness control-plane error text is
+// matched, never the provider event stream, and quota refusals (429 plan
+// limits) deliberately do not match: those must fail over to another seat.
+func transientProviderError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "please retry") || strings.Contains(msg, "overloaded")
 }
 
 func (m *Manager) recordError(lease Lease, err error) {

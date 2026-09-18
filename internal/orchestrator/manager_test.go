@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,6 +26,7 @@ type fakeHarness struct {
 	active     map[string]bool
 	beforeEmit func()
 	events     []core.Event
+	sendErrs   []error // consumed one per Send call; exhausted or nil entry = success
 }
 
 func newFakeRecipient() *fakeHarness {
@@ -51,12 +53,20 @@ func (f *fakeHarness) Send(_ context.Context, key, prompt string, emit core.Emit
 	f.calls++
 	f.keys = append(f.keys, key)
 	f.prompts = append(f.prompts, prompt)
+	var sendErr error
+	if len(f.sendErrs) > 0 {
+		sendErr = f.sendErrs[0]
+		f.sendErrs = f.sendErrs[1:]
+	}
 	thread := f.threads[key]
 	if thread == "" {
 		thread = "thread-" + key
 		f.threads[key] = thread
 	}
 	f.mu.Unlock()
+	if sendErr != nil {
+		return "", false, sendErr
+	}
 	if f.beforeEmit != nil && !strings.HasPrefix(key, "orchestrator:notification:") {
 		f.beforeEmit()
 	}
@@ -841,3 +851,77 @@ func TestResolveTargetModel(t *testing.T) {
 	}
 }
 
+
+func TestTransientProviderErrorRetriesInPlace(t *testing.T) {
+	transient := errors.New("herdr prompt failed: Error from provider (Console Go): Upstream request failed: [service_overloaded] The backend is temporarily overloaded. Please retry. (out: service_overloaded)")
+	deadRunner := errors.New("herdr prompt failed: signal: killed (out: signal: killed)")
+	for name, test := range map[string]struct {
+		errs      []error
+		wantCalls int
+		wantState string
+		wantError string
+	}{
+		// One transient refusal: retried once in place, second send succeeds,
+		// the lease reaches the normal terminal path with no recorded error.
+		"transient then success": {errs: []error{transient}, wantCalls: 2, wantState: "awaiting_transition", wantError: ""},
+		// The refusal persists past the retry: the ordinary error path runs,
+		// exactly one in-place retry was spent, no third attempt.
+		"transient twice": {errs: []error{transient, transient}, wantCalls: 2, wantState: "error", wantError: transient.Error()},
+		// A dead runner is never retried in place: it fails over at once.
+		"dead runner": {errs: []error{deadRunner}, wantCalls: 1, wantState: "error", wantError: deadRunner.Error()},
+		// A quota refusal must not retry in place; it belongs to failover.
+		"quota refusal": {errs: []error{errors.New("herdr prompt failed: 429 You've reached your weekly usage limit")}, wantCalls: 1, wantState: "error", wantError: "429"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Create(cfg, "tasks", "transient retry", ""); err != nil {
+				t.Fatal(err)
+			}
+			fake := newFakeRecipient()
+			fake.sendErrs = test.errs
+			manager := New(cfg, fake, extensions.Runner{})
+			if err := manager.ScanOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			manager.Wait()
+			if fake.calls != test.wantCalls {
+				t.Fatalf("harness calls = %d, want %d", fake.calls, test.wantCalls)
+			}
+			leases, err := manager.loadLeases()
+			if err != nil || len(leases) != 1 {
+				t.Fatalf("leases = %#v, %v", leases, err)
+			}
+			current := leases[0]
+			if current.State != test.wantState {
+				t.Fatalf("lease state = %q, want %q", current.State, test.wantState)
+			}
+			if test.wantError != "" && !strings.Contains(current.LastError, test.wantError) {
+				t.Fatalf("lease error = %q, want it to contain %q", current.LastError, test.wantError)
+			}
+			if test.wantError == "" && current.LastError != "" {
+				t.Fatalf("lease error = %q, want none", current.LastError)
+			}
+			// recordError fires captureAutopsyAndAlert on a detached goroutine
+			// that writes err-*.json under .spynel/diagnostics; wait for it so it
+			// cannot race t.TempDir cleanup.
+			if test.wantError != "" {
+				diag := cfg.StatePath("diagnostics")
+				deadline := time.Now().Add(2 * time.Second)
+				for {
+					matches, _ := filepath.Glob(filepath.Join(diag, "err-*.json"))
+					if len(matches) > 0 || time.Now().After(deadline) {
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		})
+	}
+}
