@@ -36,3 +36,4 @@ Direct child DOX files:
 | --- | --- |
 | [doxcheck/AGENTS.md](doxcheck/AGENTS.md) | Deterministic repository DOX coverage and index validation. |
 | [native-evidence/AGENTS.md](native-evidence/AGENTS.md) | Synthetic native-package execution evidence helper. |
+| [print-settings-meta/AGENTS.md](print-settings-meta/AGENTS.md) | Offline settings-metadata JSON helper for the settings console. |
