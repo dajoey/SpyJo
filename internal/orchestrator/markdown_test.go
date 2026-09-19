@@ -7,11 +7,11 @@ import (
 
 func TestParseDocumentSanitizesUnquotedColons(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		wantKey  string
-		wantSub  string
-		wantVal  string
+		name    string
+		input   string
+		wantKey string
+		wantSub string
+		wantVal string
 	}{
 		{
 			name: "waiting_for with internal colon",

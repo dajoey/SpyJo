@@ -257,10 +257,10 @@ staff:
 		t.Fatalf("valid routing rejected: %v", err)
 	}
 	for name, body := range map[string]string{
-		"unknown staff":   base + "routing:\n  - {domain: x, staff: ghost}\n",
+		"unknown staff":       base + "routing:\n  - {domain: x, staff: ghost}\n",
 		"held needs fallback": base + "routing:\n  - {domain: x, held_until: \"someday\"}\n",
-		"duplicate domain": base + "routing:\n  - {domain: x, staff: implementer}\n  - {domain: x, staff: architect}\n",
-		"empty domain": base + "routing:\n  - {domain: \"\", staff: implementer}\n",
+		"duplicate domain":    base + "routing:\n  - {domain: x, staff: implementer}\n  - {domain: x, staff: architect}\n",
+		"empty domain":        base + "routing:\n  - {domain: \"\", staff: implementer}\n",
 	} {
 		if _, err := Load(write(t, body)); err == nil {
 			t.Errorf("%s: expected an error", name)
