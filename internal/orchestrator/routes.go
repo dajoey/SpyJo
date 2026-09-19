@@ -36,6 +36,14 @@ func workflowRoutes() []workflowRoute {
 const (
 	awaitingTransitionStaleAfter      = 2 * time.Minute
 	quickAwaitingTransitionRecoveries = 3
+	// restartInterruptGrace is how long after a manager starts that a worker
+	// SIGTERM/SIGKILL is still treated as the restart that created this
+	// process, not as a dispatch failure of the task. Observed 2026-09-19:
+	// three service restarts inside six minutes killed every in-flight
+	// worker; the dying process cancels its context (covered separately),
+	// and the new process can still see the same storm for about a minute
+	// after it comes up.
+	restartInterruptGrace = 2 * time.Minute
 )
 
 func routeByName(name string) (workflowRoute, bool) {

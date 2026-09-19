@@ -996,3 +996,156 @@ func TestLiveSessionKeepsItsAwaitingTransitionLease(t *testing.T) {
 		t.Fatalf("live session lease was disturbed: %#v, %v", after, err)
 	}
 }
+
+func TestRestartSignalDuringStartupGraceDoesNotSpendAttempts(t *testing.T) {
+	// Three SIGTERM storms inside the post-start grace window must leave every
+	// in-flight task with its attempt and RecoveryCount intact and none in
+	// failed/ — the load that beat the 2026-09-18 awaiting_transition fix.
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	termErr := errors.New("herdr prompt failed: signal: terminated (out: signal: terminated)")
+	const taskCount = 3
+	manager.Config.Orchestrator.MaxParallel = taskCount
+	manager.capacityLimit = taskCount
+
+	for i := 0; i < taskCount; i++ {
+		if _, err := Create(cfg, "tasks", "survive three restart kills "+string(rune('A'+i)), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for round := 0; round < 3; round++ {
+		fake.sendErrs = nil
+		for i := 0; i < taskCount; i++ {
+			fake.sendErrs = append(fake.sendErrs, termErr)
+		}
+		if err := manager.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		manager.Wait()
+		leases, err := manager.loadLeases()
+		if err != nil || len(leases) != taskCount {
+			t.Fatalf("round %d leases = %d (%v), want %d", round, len(leases), err, taskCount)
+		}
+		for _, current := range leases {
+			if current.RecoveryCount != 0 {
+				t.Fatalf("round %d RecoveryCount = %d on %s, want 0", round, current.RecoveryCount, current.File)
+			}
+			if current.State != "error" {
+				t.Fatalf("round %d state = %q on %s, want error for quick re-adoption", round, current.State, current.File)
+			}
+			current.HeartbeatAt = time.Now().UTC().Add(-15 * time.Second)
+			if err := manager.saveLease(current); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	entries, _ := os.ReadDir(cfg.Resolve(route.Working))
+	if len(entries) != taskCount {
+		t.Fatalf("working entries = %d, want %d", len(entries), taskCount)
+	}
+	for _, entry := range entries {
+		working := filepath.Join(cfg.Resolve(route.Working), entry.Name())
+		document, err := ReadDocument(working)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if numberValue(document.FrontMatter["attempt"]) != 1 {
+			t.Fatalf("%s attempt = %v, want 1", entry.Name(), document.FrontMatter["attempt"])
+		}
+		if !strings.Contains(document.Body, "interrupted by a service restart") || !strings.Contains(document.Body, "attempt not spent") {
+			t.Fatalf("%s progress missing restart interrupt note: %s", entry.Name(), document.Body)
+		}
+	}
+	failedDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "failed")
+	failed, _ := os.ReadDir(failedDir)
+	if len(failed) != 0 {
+		t.Fatalf("tasks landed in failed/: %v", failed)
+	}
+}
+
+func TestRestartSignalAfterGraceStillCountsTowardFailure(t *testing.T) {
+	// Outside the startup grace, a SIGTERM on a healthy instance is still a
+	// real runner death and must keep the consecutive-error fail path.
+	cfg, fake, manager := workflowTestManager(t)
+	manager.startedAt = time.Now().UTC().Add(-10 * time.Minute)
+	termErr := errors.New("herdr prompt failed: signal: terminated (out: signal: terminated)")
+	fake.sendErrs = []error{termErr, termErr, termErr}
+
+	if _, err := Create(cfg, "tasks", "signal after grace fails forward", ""); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 3; round++ {
+		if err := manager.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		manager.Wait()
+		if round < 2 {
+			leases, err := manager.loadLeases()
+			if err != nil || len(leases) != 1 {
+				t.Fatalf("round %d leases = %#v, %v", round, leases, err)
+			}
+			leases[0].HeartbeatAt = time.Now().UTC().Add(-15 * time.Second)
+			if err := manager.saveLease(leases[0]); err != nil {
+				t.Fatal(err)
+			}
+			fake.sendErrs = append(fake.sendErrs, termErr)
+		}
+	}
+
+	route := workflowRoutes()[0]
+	failedDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "failed")
+	failed, _ := os.ReadDir(failedDir)
+	if len(failed) != 1 {
+		t.Fatalf("failed entries = %d, want 1 after three counted signal kills", len(failed))
+	}
+}
+
+func TestShutdownContextCancelDoesNotSpendAttempts(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	manager.startedAt = time.Now().UTC().Add(-10 * time.Minute) // grace expired; ctx cancel must still protect
+	termErr := errors.New("herdr prompt failed: signal: terminated (out: signal: terminated)")
+	fake.sendErrs = []error{termErr, termErr, termErr}
+
+	if _, err := Create(cfg, "tasks", "shutdown cancel preserves attempt", ""); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 3; round++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := manager.ScanOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		manager.Wait()
+		leases, err := manager.loadLeases()
+		if err != nil || len(leases) != 1 {
+			t.Fatalf("round %d leases = %#v, %v", round, leases, err)
+		}
+		if leases[0].RecoveryCount != 0 {
+			t.Fatalf("round %d RecoveryCount = %d, want 0", round, leases[0].RecoveryCount)
+		}
+		leases[0].HeartbeatAt = time.Now().UTC().Add(-15 * time.Second)
+		if err := manager.saveLease(leases[0]); err != nil {
+			t.Fatal(err)
+		}
+		if round < 2 {
+			fake.sendErrs = append(fake.sendErrs, termErr)
+		}
+	}
+	route := workflowRoutes()[0]
+	failed, _ := os.ReadDir(filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "failed"))
+	if len(failed) != 0 {
+		t.Fatalf("shutdown cancel moved tasks to failed/: %v", failed)
+	}
+	entries, _ := os.ReadDir(cfg.Resolve(route.Working))
+	if len(entries) != 1 {
+		t.Fatalf("working entries = %d, want 1", len(entries))
+	}
+	document, err := ReadDocument(filepath.Join(cfg.Resolve(route.Working), entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if numberValue(document.FrontMatter["attempt"]) != 1 {
+		t.Fatalf("attempt = %v, want 1", document.FrontMatter["attempt"])
+	}
+}

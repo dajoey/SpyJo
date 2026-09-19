@@ -120,6 +120,9 @@ type Manager struct {
 	cleanupDays                 atomic.Int64
 	cleanupTicks                <-chan time.Time
 	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
+	// startedAt bounds the post-restart window where a worker SIGTERM/SIGKILL
+	// is attributed to the service lifecycle instead of the task.
+	startedAt time.Time
 }
 
 // SetPrimaryOwned records whether this manager belongs to the elected
@@ -228,6 +231,7 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		heartbeatConfigChanged: make(chan struct{}, 1),
 		heartbeatManual:        make(chan heartbeatManualRequest),
 		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
+		startedAt: time.Now().UTC(),
 	}
 	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
 	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
@@ -605,7 +609,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		if phase == phaseTaskImplementation && m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "phase": phase, "file": target, "id": documentID})
 			if hookErr != nil {
-				m.recordError(lease, hookErr)
+				m.recordError(ctx, lease, hookErr)
 				continue
 			}
 			if output.Cancel {
@@ -720,26 +724,26 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			lease.LastError = ""
 			lease.HeartbeatAt = time.Now().UTC()
 			if err := m.saveLease(lease); err != nil {
-				m.recordError(lease, err)
+				m.recordError(ctx, lease, err)
 				return
 			}
 			recoveryAttempt := lease.RecoveryCount + 1
 			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
 			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
-				m.recordError(lease, fmt.Errorf("record recovery progress: %w", err))
+				m.recordError(ctx, lease, fmt.Errorf("record recovery progress: %w", err))
 				return
 			}
 		}
 		prompt, err := m.renderPrompt(route, lease, promptPath)
 		if err != nil {
-			m.recordError(lease, err)
+			m.recordError(ctx, lease, err)
 			return
 		}
 		harnessSettings := m.harnessSettings()
 		prompt = config.PrependAgentPrefix(m.agentPrefix(lease.Phase, harnessSettings), prompt)
 		firstAssignedAt, providerIterations, err := ReserveProviderTurn(lease.File, time.Now().UTC())
 		if err != nil {
-			m.recordError(lease, err)
+			m.recordError(ctx, lease, err)
 			return
 		}
 		jobID := 0
@@ -752,7 +756,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 			jobID, err = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
 			if err != nil {
-				m.recordError(lease, err)
+				m.recordError(ctx, lease, err)
 				return
 			}
 			m.setRuntimeJob(lease.ID, jobID)
@@ -865,7 +869,7 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "error", Detail: err.Error()})
 			}
 			finish()
-			m.recordError(lease, err)
+			m.recordError(ctx, lease, err)
 			return
 		}
 		current, loadErr := m.loadLease(lease.ID)
@@ -2113,7 +2117,68 @@ func (m *Manager) restoreLeaseForRetry(leaseID string, recovery bool) {
 	}
 }
 
-func (m *Manager) recordError(lease Lease, err error) {
+// restartInterrupted reports whether a harness/dispatch error is the
+// orchestrator's own lifecycle (service stop or the settling window after a
+// start) rather than a defect of the task being dispatched. Those kills must
+// not increment RecoveryCount or the consecutive-error path into failed/.
+func (m *Manager) restartInterrupted(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if !signalLifecycleError(err) {
+		return false
+	}
+	started := m.startedAt
+	if started.IsZero() {
+		return false
+	}
+	return time.Since(started) < restartInterruptGrace
+}
+
+func signalLifecycleError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "signal: terminated") || strings.Contains(msg, "signal: killed")
+}
+
+// recordRestartInterrupt parks the lease for ordinary re-adoption without
+// spending RecoveryCount, phase attempt, or the consecutive-error fail path.
+// Drain-on-shutdown is deliberately not used: re-adoption already preserves
+// the claim, and delaying a binary install for in-flight turns is what made
+// operators force-kill tonight.
+func (m *Manager) recordRestartInterrupt(lease Lease, err error) {
+	now := time.Now().UTC()
+	if current, loadErr := m.loadLease(lease.ID); loadErr == nil {
+		lease = current
+	}
+	lease.LastError = err.Error()
+	lease.State = "error"
+	lease.HeartbeatAt = now
+	if saveErr := m.saveLease(lease); saveErr != nil {
+		m.log("save restart-interrupted lease: " + saveErr.Error())
+	}
+	note := fmt.Sprintf("interrupted by a service restart at %s; attempt not spent", now.Format(time.RFC3339))
+	if progressErr := updateDocumentProgress(lease.File, now, note); progressErr != nil {
+		m.log("record restart interrupt progress: " + progressErr.Error())
+	}
+	msg := fmt.Sprintf("restart interrupted %s: %v", lease.File, err)
+	if m.LogError != nil {
+		m.LogError("orchestrator", "restart_interrupt", msg)
+	} else {
+		m.log(msg)
+	}
+}
+
+func (m *Manager) recordError(ctx context.Context, lease Lease, err error) {
+	if m.restartInterrupted(ctx, err) {
+		m.recordRestartInterrupt(lease, err)
+		return
+	}
 	lease.LastError = err.Error()
 	lease.RecoveryCount++
 	lease.State = "error"
