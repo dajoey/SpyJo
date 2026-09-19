@@ -27,6 +27,10 @@ type fakeHarness struct {
 	beforeEmit func()
 	events     []core.Event
 	sendErrs   []error // consumed one per Send call; exhausted or nil entry = success
+	// Real harnesses emit their own terminal event immediately before returning
+	// a send error: an error for a refused turn, a final for a turn that
+	// completed and then failed on the way back.
+	sendErrFinal bool
 }
 
 func newFakeRecipient() *fakeHarness {
@@ -65,6 +69,14 @@ func (f *fakeHarness) Send(_ context.Context, key, prompt string, emit core.Emit
 	}
 	f.mu.Unlock()
 	if sendErr != nil {
+		if emit != nil {
+			event := core.Event{Kind: core.EventError, Text: sendErr.Error(), ThreadID: thread, Done: true}
+			if f.sendErrFinal {
+				final := "done"
+				event = core.Event{Kind: core.EventFinal, Text: final, FinalText: &final, ThreadID: thread, Done: true}
+			}
+			emit(event)
+		}
 		return "", false, sendErr
 	}
 	if f.beforeEmit != nil && !strings.HasPrefix(key, "orchestrator:notification:") {
@@ -851,19 +863,24 @@ func TestResolveTargetModel(t *testing.T) {
 	}
 }
 
-
 func TestTransientProviderErrorRetriesInPlace(t *testing.T) {
 	transient := errors.New("herdr prompt failed: Error from provider (Console Go): Upstream request failed: [service_overloaded] The backend is temporarily overloaded. Please retry. (out: service_overloaded)")
 	deadRunner := errors.New("herdr prompt failed: signal: killed (out: signal: killed)")
 	for name, test := range map[string]struct {
 		errs      []error
+		final     bool
 		wantCalls int
 		wantState string
 		wantError string
 	}{
 		// One transient refusal: retried once in place, second send succeeds,
 		// the lease reaches the normal terminal path with no recorded error.
+		// The harness emits its own terminal error beside the refusal, exactly
+		// as herdr does, and that must not veto the retry.
 		"transient then success": {errs: []error{transient}, wantCalls: 2, wantState: "awaiting_transition", wantError: ""},
+		// A turn that produced its final response and then failed on the way
+		// back has already done its work: reconciliation owns it, not a retry.
+		"transient after a completed turn": {errs: []error{transient}, final: true, wantCalls: 1, wantState: "error", wantError: transient.Error()},
 		// The refusal persists past the retry: the ordinary error path runs,
 		// exactly one in-place retry was spent, no third attempt.
 		"transient twice": {errs: []error{transient, transient}, wantCalls: 2, wantState: "error", wantError: transient.Error()},
@@ -886,6 +903,7 @@ func TestTransientProviderErrorRetriesInPlace(t *testing.T) {
 			}
 			fake := newFakeRecipient()
 			fake.sendErrs = test.errs
+			fake.sendErrFinal = test.final
 			manager := New(cfg, fake, extensions.Runner{})
 			if err := manager.ScanOnce(context.Background()); err != nil {
 				t.Fatal(err)

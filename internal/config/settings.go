@@ -23,6 +23,29 @@ type Setting struct {
 	Advanced            bool
 }
 
+// SettingsJSON renders a settings catalog as the one JSON projection shared by
+// the loopback settings endpoint and the offline settings-metadata helper, so a
+// new catalog field reaches both without drifting between two hand-kept copies.
+func SettingsJSON(settings []Setting) []map[string]any {
+	items := make([]map[string]any, 0, len(settings))
+	for _, setting := range settings {
+		item := map[string]any{
+			"key":         setting.Key,
+			"section":     setting.Section,
+			"description": setting.Description,
+			"value":       setting.Value,
+			"secret":      setting.Secret,
+			"restart":     setting.Restart,
+			"advanced":    setting.Advanced,
+		}
+		if len(setting.Choices) > 0 {
+			item["choices"] = setting.Choices
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
 // Settings returns every user-facing scalar setting in deterministic order.
 func Settings(cfg Config) []Setting {
 	values := []Setting{

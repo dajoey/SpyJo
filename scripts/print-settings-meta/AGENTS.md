@@ -10,6 +10,8 @@
 
 - Read-only developer helper: it never reads workspace or runtime state and is
   not part of build, release, or smoke flows.
+- Emit the catalog through `config.SettingsJSON` so this helper and the
+  `GET /v1/settings` response stay byte-identical in shape.
 - Remove it once every installation runs a binary that serves the endpoint.
 
 ## Child DOX Index

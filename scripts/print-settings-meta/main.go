@@ -11,22 +11,7 @@ import (
 )
 
 func main() {
-	items := make([]map[string]any, 0)
-	for _, setting := range config.Settings(config.Config{}) {
-		item := map[string]any{
-			"key":         setting.Key,
-			"section":     setting.Section,
-			"description": setting.Description,
-			"value":       setting.Value,
-			"secret":      setting.Secret,
-			"restart":     setting.Restart,
-			"advanced":    setting.Advanced,
-		}
-		if len(setting.Choices) > 0 {
-			item["choices"] = setting.Choices
-		}
-		items = append(items, item)
-	}
+	items := config.SettingsJSON(config.Settings(config.Config{}))
 	if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"settings": items}); err != nil {
 		fmt.Fprintf(os.Stderr, "encode: %v\n", err)
 		os.Exit(1)

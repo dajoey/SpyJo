@@ -723,7 +723,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		h.mu.Unlock()
 		close(turn.done)
 		if isOrchestratorKey(cleanKey) {
-			go h.cleanupCompletedTab(tabID, paneID, target)
+			go h.cleanupCompletedTab(key, tabID, paneID, target)
 		}
 	}()
 
@@ -1351,7 +1351,11 @@ func (h *Herdr) isTabFocused(tabID string) bool {
 // cleanupCompletedTab closes a dynamic worker tab once its turn finishes.
 // If the user is currently focused on the tab, it waits until they switch away
 // before closing so that output is not pulled out from under their eyes.
-func (h *Herdr) cleanupCompletedTab(tabID, paneID, agentName string) {
+// A later turn on the same key reuses this same registered worker and tab (an
+// orchestrator retry re-sends immediately), so the close happens only while
+// this key's send lock is free and no turn is active; otherwise the newer turn
+// owns the worker and runs its own cleanup when it ends.
+func (h *Herdr) cleanupCompletedTab(key, tabID, paneID, agentName string) {
 	if tabID == "" && paneID == "" {
 		return
 	}
@@ -1369,6 +1373,11 @@ func (h *Herdr) cleanupCompletedTab(tabID, paneID, agentName string) {
 				return
 			}
 
+			// A newer turn already claimed this worker: it owns the tab.
+			if h.IsActive(key) {
+				return
+			}
+
 			// If tab was already closed or removed, nothing more to do
 			if !h.tabExists(tabID) {
 				return
@@ -1380,7 +1389,21 @@ func (h *Herdr) cleanupCompletedTab(tabID, paneID, agentName string) {
 			}
 			time.Sleep(1500 * time.Millisecond)
 		}
+	}
 
+	// Hold the key's send lock across the close so a turn that is resolving its
+	// target right now cannot adopt the tab while it is being torn down. A lock
+	// already held means a newer turn is running on this worker: leave it alone.
+	lock := h.lockForKey(key)
+	if !lock.TryLock() {
+		return
+	}
+	defer lock.Unlock()
+	if h.IsActive(key) {
+		return
+	}
+
+	if tabID != "" {
 		_ = exec.Command(h.config.Command, "tab", "close", tabID).Run()
 	} else if paneID != "" {
 		_ = exec.Command(h.config.Command, "pane", "close", paneID).Run()

@@ -400,23 +400,7 @@ func (s *Server) screenAction(response http.ResponseWriter, request *http.Reques
 }
 
 func (s *Server) listSettings(response http.ResponseWriter, request *http.Request) {
-	settings := config.Settings(s.Service.Settings.Snapshot())
-	items := make([]map[string]any, 0, len(settings))
-	for _, setting := range settings {
-		item := map[string]any{
-			"key":         setting.Key,
-			"section":     setting.Section,
-			"description": setting.Description,
-			"value":       setting.Value,
-			"secret":      setting.Secret,
-			"restart":     setting.Restart,
-			"advanced":    setting.Advanced,
-		}
-		if len(setting.Choices) > 0 {
-			item["choices"] = setting.Choices
-		}
-		items = append(items, item)
-	}
+	items := config.SettingsJSON(config.Settings(s.Service.Settings.Snapshot()))
 	writeJSON(response, http.StatusOK, map[string]any{"settings": items})
 }
 

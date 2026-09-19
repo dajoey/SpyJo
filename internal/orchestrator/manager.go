@@ -761,7 +761,11 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 		// Admission and asynchronous events must not overwrite each other's
 		// lease state (especially a terminal event racing Send's return).
 		var lifecycleMu sync.Mutex
-		var terminalSeen bool
+		// Only a terminal FINAL event proves the turn actually ran to
+		// completion. A terminal error is what a harness emits immediately
+		// beside the very send error an in-place retry classifies, so it must
+		// not veto that retry.
+		var terminalFinalSeen bool
 		emit := func(event core.Event) {
 			lifecycleMu.Lock()
 			defer lifecycleMu.Unlock()
@@ -769,8 +773,8 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				return
 			}
 			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
-			if terminal {
-				terminalSeen = true
+			if terminal && event.Kind == core.EventFinal {
+				terminalFinalSeen = true
 			}
 			if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, event)
@@ -821,23 +825,35 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			} else {
 				threadID, steered, err = m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
 			}
-			if err == nil || sendAttempt >= 1 {
+			if err == nil || sendAttempt >= 1 || ctx.Err() != nil {
 				break
 			}
 			// A provider refusing work right now (backend overload, "please
 			// retry") is not a failed worker: retry once in place so it costs
 			// neither a re-claim (attempt++ and an escalation rung) nor a
 			// fallback seat. A dead runner (signal/exit-code errors) never
-			// matches here and fails over immediately, and a lease whose
-			// failed attempt already reached a terminal event belongs to
-			// transition reconciliation, not to a retry.
+			// matches here and fails over immediately, and a turn that already
+			// produced its final response belongs to transition
+			// reconciliation, not to a retry.
 			lifecycleMu.Lock()
-			eligible := !terminalSeen && transientProviderError(err)
+			eligible := !terminalFinalSeen && transientProviderError(err)
+			if eligible {
+				// The refused attempt emitted its own terminal error, which
+				// parked the lease in awaiting_transition under that text. The
+				// retry is the same turn, so hand the lease back to live work
+				// before dispatching it.
+				m.restoreLeaseForRetry(lease.ID, recovery)
+			}
 			lifecycleMu.Unlock()
 			if !eligible {
 				break
 			}
 			m.log(fmt.Sprintf("transient provider refusal on %s, retrying once in place: %v", lease.File, err))
+			emit(core.Event{
+				Kind:      core.EventStatus,
+				Text:      "The provider refused this turn as busy; retrying once on the same worker.",
+				Execution: &core.ExecutionStatus{State: "running", Detail: "transient provider refusal: retrying once in place"},
+			})
 		}
 		lifecycleMu.Lock()
 		defer lifecycleMu.Unlock()
@@ -2073,6 +2089,28 @@ func transientProviderError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "please retry") || strings.Contains(msg, "overloaded")
+}
+
+// restoreLeaseForRetry returns a lease parked by a refused attempt's terminal
+// error to live-work state, so an in-place retry is neither observed as a turn
+// awaiting transition reconciliation nor left carrying the refusal it recovered
+// from.
+func (m *Manager) restoreLeaseForRetry(leaseID string, recovery bool) {
+	current, err := m.loadLease(leaseID)
+	if err != nil {
+		return
+	}
+	current.LastError = ""
+	if current.State == "awaiting_transition" {
+		current.State = "processing"
+		if recovery {
+			current.State = "recovering"
+		}
+	}
+	current.HeartbeatAt = time.Now().UTC()
+	if err := m.saveLease(current); err != nil {
+		m.log("save lease retry state: " + err.Error())
+	}
 }
 
 func (m *Manager) recordError(lease Lease, err error) {
