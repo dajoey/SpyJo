@@ -3,6 +3,8 @@ package harness
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -387,6 +389,41 @@ func sanitizeTag(s string) string {
 	return res
 }
 
+// fitHerdrWorkerName builds a herdr agent name of at most 32 characters matching
+// [a-z0-9_-]. When prefix+body fits, the result is that concatenation (trimmed).
+// When it does not, a readable head of body is kept and a stable 6-hex sha1 of
+// hashSource is appended so IDs that differ only past the old head-truncate point
+// stay unique and deterministic across restarts (re-adoption looks panes up by name).
+func fitHerdrWorkerName(prefix, body, hashSource string) string {
+	const maxLen = 32
+	body = strings.Trim(body, "-_")
+	name := prefix + body
+	if len(name) <= maxLen {
+		return strings.Trim(name, "-_")
+	}
+	sum := sha1.Sum([]byte(hashSource))
+	hash6 := hex.EncodeToString(sum[:])[:6]
+	suffix := "-" + hash6
+	maxBody := maxLen - len(prefix) - len(suffix)
+	if maxBody < 1 {
+		fallback := prefix + hash6
+		if len(fallback) > maxLen {
+			fallback = fallback[:maxLen]
+		}
+		return strings.Trim(fallback, "-_")
+	}
+	head := body
+	if len(head) > maxBody {
+		head = head[:maxBody]
+	}
+	head = strings.Trim(head, "-_")
+	result := prefix + head + suffix
+	if len(result) > maxLen {
+		result = result[:maxLen]
+	}
+	return strings.Trim(result, "-_")
+}
+
 func workerNameAndLabel(key, model string) (workerName string, tabLabel string) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "default" {
@@ -398,11 +435,11 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 	// Background orchestrator jobs
 	if strings.HasPrefix(cleanKey, "orchestrator:") || cleanKey == "heartbeat" {
 		if cleanKey == "orchestrator:semantic-heartbeat" || cleanKey == "heartbeat" {
-			workerName = fmt.Sprintf("sj-hb-%s", model)
-			if len(workerName) > 32 {
-				workerName = workerName[:32]
+			modelTag := sanitizeTag(model)
+			if modelTag == "" {
+				modelTag = "opencode"
 			}
-			workerName = strings.Trim(workerName, "-_")
+			workerName = fitHerdrWorkerName("sj-hb-", modelTag, modelTag)
 			tabLabel = fmt.Sprintf("Heartbeat (%s)", model)
 			return
 		}
@@ -446,31 +483,16 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 
 			// Herdr limits agent names to 1-32 lowercase characters [a-z0-9_-]
 			prefix := fmt.Sprintf("sj-%s-a%s-", phaseCode, attempt)
-			maxIDLen := 32 - len(prefix)
-			nameID := shortID
-			if maxIDLen > 0 && len(nameID) > maxIDLen {
-				nameID = nameID[:maxIDLen]
-			}
-			nameID = strings.Trim(nameID, "-_")
-
-			workerName = prefix + nameID
-			if len(workerName) > 32 {
-				workerName = workerName[:32]
-			}
-			workerName = strings.Trim(workerName, "-_")
+			workerName = fitHerdrWorkerName(prefix, shortID, shortID)
 			tabLabel = fmt.Sprintf("%s: %s (%s)", phaseLabel, shortID, model)
 			return
 		}
 
 		sanitized := sanitizeTag(cleanKey)
-		if len(sanitized) > 20 {
-			sanitized = sanitized[len(sanitized)-20:]
+		if sanitized == "" {
+			sanitized = "job"
 		}
-		workerName = fmt.Sprintf("sj-o-%s", sanitized)
-		if len(workerName) > 32 {
-			workerName = workerName[:32]
-		}
-		workerName = strings.Trim(workerName, "-_")
+		workerName = fitHerdrWorkerName("sj-o-", sanitized, sanitized)
 		tabLabel = fmt.Sprintf("Task (%s)", model)
 		return
 	}
@@ -487,38 +509,32 @@ func workerNameAndLabel(key, model string) (workerName string, tabLabel string) 
 			conv = parts[2]
 		}
 
+		channel = sanitizeTag(channel)
+		if channel == "" {
+			channel = "tui"
+		}
 		shortConv := conv
 		shortConv = strings.TrimPrefix(shortConv, "local-")
 		shortConv = sanitizeTag(shortConv)
-		if len(shortConv) > 12 {
-			shortConv = shortConv[:12]
-		}
 		if shortConv == "" {
 			shortConv = "main"
 		}
 
-		workerName = fmt.Sprintf("sj-c-%s-%s", channel, shortConv)
-		if len(workerName) > 32 {
-			workerName = workerName[:32]
+		labelConv := shortConv
+		if len(labelConv) > 12 {
+			labelConv = labelConv[:12]
 		}
-		workerName = strings.Trim(workerName, "-_")
-		tabLabel = fmt.Sprintf("Chat: %s (%s)", shortConv, model)
+		workerName = fitHerdrWorkerName(fmt.Sprintf("sj-c-%s-", channel), shortConv, shortConv)
+		tabLabel = fmt.Sprintf("Chat: %s (%s)", labelConv, model)
 		return
 	}
 
 	// Generic fallback
 	sanitized := sanitizeTag(cleanKey)
-	if len(sanitized) > 24 {
-		sanitized = sanitized[:24]
-	}
 	if sanitized == "" {
 		sanitized = "worker"
 	}
-	workerName = fmt.Sprintf("sj-%s", sanitized)
-	if len(workerName) > 32 {
-		workerName = workerName[:32]
-	}
-	workerName = strings.Trim(workerName, "-_")
+	workerName = fitHerdrWorkerName("sj-", sanitized, sanitized)
 	tabLabel = fmt.Sprintf("SpyJo (%s)", model)
 	return
 }

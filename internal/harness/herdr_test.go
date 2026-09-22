@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -160,6 +161,37 @@ func TestCleanHerdrTerminalOutput(t *testing.T) {
 	}
 }
 
+func TestWorkerNameAndLabelSiblingHelmIDsDoNotCollide(t *testing.T) {
+	// Real sibling Helm task IDs from 2026-09-22 agent_name_taken (errors.jsonl).
+	// Distinguishing tails sit past the old 32-char head truncate, so both used to
+	// become sj-t-a1-helm-joey-20260922-bugsi and the second dispatch failed.
+	id7 := "tasks-helm-joey-20260922-bugsink-ops-scripts-7--a6420351-1790117702"
+	id8 := "tasks-helm-joey-20260922-bugsink-ops-scripts-8--33005b1c-1790117703"
+	key7 := "orchestrator:tasks:task_implementation:" + id7 + ":1"
+	key8 := "orchestrator:tasks:task_implementation:" + id8 + ":1"
+
+	name7, _ := workerNameAndLabel(key7, "opencode")
+	name8, _ := workerNameAndLabel(key8, "opencode")
+
+	nameRe := regexp.MustCompile(`^[a-z0-9_-]+$`)
+	for _, name := range []string{name7, name8} {
+		if len(name) == 0 || len(name) > 32 {
+			t.Errorf("worker name %q length %d, want 1..32", name, len(name))
+		}
+		if !nameRe.MatchString(name) {
+			t.Errorf("worker name %q must match [a-z0-9_-]+", name)
+		}
+	}
+	if name7 == name8 {
+		t.Fatalf("sibling Helm task IDs collided on worker name %q", name7)
+	}
+	// Deterministic across restarts (re-adoption looks panes up by this name).
+	name7b, _ := workerNameAndLabel(key7, "opencode")
+	if name7b != name7 {
+		t.Fatalf("worker name for %s not stable: %q then %q", id7, name7, name7b)
+	}
+}
+
 func TestWorkerNameAndLabel(t *testing.T) {
 	tests := []struct {
 		key          string
@@ -194,7 +226,7 @@ func TestWorkerNameAndLabel(t *testing.T) {
 		{
 			key:          "chat:tui:local-2a0229b8d17f26ca2335fa4eaaf39397",
 			model:        "opencode",
-			wantName:     "sj-c-tui-2a0229b8d17f",
+			wantName:     "sj-c-tui-2a0229b8d17f26ca-31c8d3",
 			wantTabLabel: "Chat: 2a0229b8d17f (opencode)",
 		},
 		{
