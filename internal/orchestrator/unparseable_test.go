@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/extensions"
@@ -239,5 +240,150 @@ func TestUnparseableRepairIDIsAStableSlug(t *testing.T) {
 	}
 	if second := unparseableRepairID("/other/goals-20260919 Gluttony.md"); second != first {
 		t.Fatalf("repair id is not stable across directories: %q vs %q", second, first)
+	}
+}
+
+const validScratchTaskFrontMatter = `---
+id: tasks-scratch-valid
+title: "valid task"
+status: todo
+created_at: "2026-09-22T00:00:00Z"
+updated_at: "2026-09-22T00:00:00Z"
+review_required: false
+---
+
+# valid task
+`
+
+func assertValidTaskClaimed(t *testing.T, cfg config.Config) {
+	t.Helper()
+	if _, err := os.Stat(cfg.StatePath("tasks", "working", "tasks-scratch-valid.md")); err != nil {
+		t.Fatalf("valid task was not claimed into working/: %v", err)
+	}
+	if _, err := os.Stat(cfg.StatePath("tasks", "todo", "tasks-scratch-valid.md")); !os.IsNotExist(err) {
+		t.Fatalf("valid task still sits in todo/: %v", err)
+	}
+}
+
+// A broken document in review/ whose implementation lease is still open used to
+// abort reconcileTransitions and stop every later claim (2026-09-22 stall).
+func TestScanOnceClaimsAlongsideUnparseableReviewDocument(t *testing.T) {
+	root, cfg := newScratchWorkspace(t)
+	writeScratchDocument(t, cfg.StatePath("tasks", "todo", "tasks-scratch-valid.md"), validScratchTaskFrontMatter)
+	corrupt := cfg.StatePath("tasks", "review", "tasks-scratch-corrupt.md")
+	writeScratchDocument(t, corrupt, corruptTaskFrontMatter)
+
+	now := time.Now().UTC()
+	key := leaseID("tasks:"+phaseTaskImplementation, "tasks-scratch-corrupt")
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
+	var errorRecords []string
+	manager.LogError = func(component, event, message string) {
+		errorRecords = append(errorRecords, component+"|"+event+"|"+message)
+	}
+	if err := manager.saveLease(Lease{
+		ID: key, ClaimID: key, DocumentType: "task", Route: "tasks",
+		OwnerID: manager.ownerID, File: cfg.StatePath("tasks", "working", "tasks-scratch-corrupt.md"),
+		SessionKey: "sess", State: "awaiting_transition", Phase: phaseTaskImplementation,
+		ClaimAttempt: 1, StartedAt: now, HeartbeatAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce aborted the board on one unreadable review document: %v", err)
+	}
+	manager.Wait()
+	assertValidTaskClaimed(t, cfg)
+
+	repairs := liveRepairTasks(t, cfg)
+	if body := readRepairTask(t, repairs, corrupt); !strings.Contains(body, "tasks-scratch-corrupt.md") {
+		t.Fatalf("repair task does not name the corrupt review document:\n%s", body)
+	}
+	if len(errorRecords) != 1 || !strings.Contains(errorRecords[0], "|unparseable_document|") {
+		t.Fatalf("error records = %#v, want one unparseable_document", errorRecords)
+	}
+	// Lease retained so a repaired document can still finish reconciliation.
+	if !manager.leaseExists(key) {
+		t.Fatal("implementation lease was dropped before the document could be repaired")
+	}
+	got, err := os.ReadFile(corrupt)
+	if err != nil || string(got) != corruptTaskFrontMatter {
+		t.Fatal("corrupt review document was rewritten")
+	}
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if len(errorRecords) != 1 {
+		t.Fatalf("second cycle repeated the error record: %#v", errorRecords)
+	}
+	if again := liveRepairTasks(t, cfg); len(again) != 1 {
+		t.Fatalf("live repair tasks = %v, want exactly one", keysOf(again))
+	}
+}
+
+// A broken orphan in working/ used to abort recoverOrphanClaims (startExistingClaim
+// returned the YAML error) and stop every later claim.
+func TestScanOnceClaimsAlongsideUnparseableWorkingDocument(t *testing.T) {
+	root, cfg := newScratchWorkspace(t)
+	writeScratchDocument(t, cfg.StatePath("tasks", "todo", "tasks-scratch-valid.md"), validScratchTaskFrontMatter)
+	corrupt := cfg.StatePath("tasks", "working", "tasks-scratch-corrupt.md")
+	writeScratchDocument(t, corrupt, corruptTaskFrontMatter)
+
+	// Lease present on the broken working document: resumeInterruptedClaims must
+	// soft-skip it instead of aborting the scan (State claiming + file present).
+	now := time.Now().UTC()
+	key := leaseID("tasks:"+phaseTaskImplementation, "tasks-scratch-corrupt")
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
+	var errorRecords []string
+	manager.LogError = func(component, event, message string) {
+		errorRecords = append(errorRecords, component+"|"+event+"|"+message)
+	}
+	if err := manager.saveLease(Lease{
+		ID: key, ClaimID: key, DocumentType: "task", Route: "tasks",
+		OwnerID: manager.ownerID, File: corrupt, SessionKey: "sess",
+		State: "claiming", Phase: phaseTaskImplementation,
+		ClaimAttempt: 1, StartedAt: now, HeartbeatAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce aborted the board on one unreadable working document: %v", err)
+	}
+	manager.Wait()
+	assertValidTaskClaimed(t, cfg)
+	if body := readRepairTask(t, liveRepairTasks(t, cfg), corrupt); !strings.Contains(body, "tasks-scratch-corrupt.md") {
+		t.Fatalf("repair task does not name the corrupt working document:\n%s", body)
+	}
+	if len(errorRecords) != 1 {
+		t.Fatalf("error records = %#v, want one", errorRecords)
+	}
+}
+
+// A broken active goal must cost only that goal: other task claims continue and
+// exactly one repair task is filed (coverage already soft before this change).
+func TestScanOnceClaimsAlongsideUnparseableActiveGoal(t *testing.T) {
+	root, cfg := newScratchWorkspace(t)
+	writeScratchDocument(t, cfg.StatePath("tasks", "todo", "tasks-scratch-valid.md"), validScratchTaskFrontMatter)
+	corrupt := cfg.StatePath("goals", "active", "goals-scratch-corrupt.md")
+	writeScratchDocument(t, corrupt, corruptGoalFrontMatter)
+
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
+	var errorRecords []string
+	manager.LogError = func(component, event, message string) {
+		errorRecords = append(errorRecords, component+"|"+event+"|"+message)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("ScanOnce aborted the board on one unreadable active goal: %v", err)
+	}
+	manager.Wait()
+	assertValidTaskClaimed(t, cfg)
+	if body := readRepairTask(t, liveRepairTasks(t, cfg), corrupt); !strings.Contains(body, "this goal document's YAML front matter") {
+		t.Fatalf("goal repair is not written as a goal repair:\n%s", body)
+	}
+	if len(errorRecords) != 1 {
+		t.Fatalf("error records = %#v, want one", errorRecords)
 	}
 }

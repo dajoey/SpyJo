@@ -629,7 +629,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, path, phase string, recovery, incrementAttempt bool) error {
 	document, err := ReadDocument(path)
 	if err != nil {
-		return err
+		return m.skipUnreadableDocument(path, err)
 	}
 	id := documentID(document)
 	if id == "" {
@@ -942,12 +942,20 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 			status, path, err = m.reconcileGoalTransition(ctx, route, lease, phase, status, path)
 		}
 		if err != nil {
+			// Keep the lease so a later scan can finish the transition once the
+			// document is repaired; do not abort the rest of the board.
+			if errors.Is(err, errUnreadableDocument) {
+				continue
+			}
 			return err
 		}
 		_ = os.Remove(m.leasePath(lease.ID))
 		m.finishRuntimeJob(lease.ID)
 		if route.Name == "goals" && phase == phaseGoalReview && status == "planning" {
 			if err := m.startExistingClaim(ctx, route, path, phaseGoalPlanning, false, true); err != nil {
+				if errors.Is(err, errUnreadableDocument) {
+					continue
+				}
 				return err
 			}
 		}
@@ -977,7 +985,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 	if phase == phaseTaskImplementation {
 		document, readErr := ReadDocument(path)
 		if readErr != nil {
-			return status, path, readErr
+			return status, path, m.skipUnreadableDocument(path, readErr)
 		}
 		policy, policyErr := TaskPolicyFromDocument(document)
 		if policyErr != nil {
@@ -1036,7 +1044,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 		if status == "review" {
 			document, err := ReadDocument(path)
 			if err != nil {
-				return status, path, err
+				return status, path, m.skipUnreadableDocument(path, err)
 			}
 			document.FrontMatter["implementation_thread"] = lease.ThreadID
 			document.FrontMatter["implementation_session"] = lease.SessionKey
@@ -1095,7 +1103,7 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route workflowRoute
 	name := filepath.Base(path)
 	document, err := ReadDocument(path)
 	if err != nil {
-		return status, path, err
+		return status, path, m.skipUnreadableDocument(path, err)
 	}
 	if phase == phaseGoalPlanning {
 		if status == "active" {
@@ -1135,7 +1143,7 @@ func (m *Manager) redirectTransition(path, target, status, note string) (string,
 func (m *Manager) completeTransition(ctx context.Context, route workflowRoute, lease Lease, status, path string) error {
 	document, err := ReadDocument(path)
 	if err != nil {
-		return err
+		return m.skipUnreadableDocument(path, err)
 	}
 	runtimeCfg := m.runtimeSnapshot()
 	if runtimeCfg.Extensions.Enabled {
@@ -1195,6 +1203,10 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 				field := phaseAttemptField(phase)
 				document, claimErr := m.claimPhaseDocument(lease.SourceFile, lease.File, phaseClaimedStatus(phase), field, time.Now())
 				if claimErr != nil {
+					if _, readErr := ReadDocument(lease.SourceFile); readErr != nil {
+						_ = m.skipUnreadableDocument(lease.SourceFile, readErr)
+						continue
+					}
 					return claimErr
 				}
 				if lease.ClaimAttempt == 0 {
@@ -1211,7 +1223,8 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			field := phaseAttemptField(phase)
 			document, readErr := ReadDocument(lease.File)
 			if readErr != nil {
-				return readErr
+				_ = m.skipUnreadableDocument(lease.File, readErr)
+				continue
 			}
 			attempt := lease.ClaimAttempt
 			if attempt < 1 {
@@ -1285,6 +1298,9 @@ func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
 				}
 				m.log("recovering claimed document without lease: " + path)
 				if err := m.startExistingClaim(ctx, route, path, phase, true, false); err != nil {
+					if errors.Is(err, errUnreadableDocument) {
+						continue
+					}
 					return err
 				}
 			}
@@ -1372,6 +1388,9 @@ func (m *Manager) wakeWaitingDocuments(ctx context.Context) error {
 			}
 			if route.Name == "goals" && targetStatus == "planning" {
 				if err := m.startExistingClaim(ctx, route, target, phaseGoalPlanning, false, true); err != nil {
+					if errors.Is(err, errUnreadableDocument) {
+						continue
+					}
 					return err
 				}
 			}

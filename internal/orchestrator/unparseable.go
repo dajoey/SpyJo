@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,21 @@ import (
 
 	"github.com/agent0ai/spynel/internal/fsx"
 )
+
+// errUnreadableDocument marks a per-document parse/read failure. scanOnce must
+// report that document and continue; only errors that are not about one durable
+// file (lease dir, route dirs, config) may abort the scan.
+var errUnreadableDocument = errors.New("unreadable durable document")
+
+// skipUnreadableDocument reports the broken durable file and returns the
+// sentinel that lets the scan continue with every other document.
+func (m *Manager) skipUnreadableDocument(path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	m.reportUnparseableDocument(path, err)
+	return errUnreadableDocument
+}
 
 // unparseableRepairPrefix marks the repair tasks this file creates. A repair
 // task that is itself unparseable must never produce another repair task.
