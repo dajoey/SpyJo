@@ -985,7 +985,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 	base := filepath.Dir(m.Config.Resolve(route.Source))
 	name := filepath.Base(path)
 	// Whatever this turn wrote, its transition carries no resume credit
-	// unless Spynel grants one below for a park.
+	// unless Spynel grants one below for a park or a format-only rejection.
 	if err := setResumeCredit(path, false); err != nil {
 		m.log("clear resume credit " + path + ": " + err.Error())
 	}
@@ -1061,9 +1061,25 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 		}
 		if status == "done" && !reviewRequired {
 			if evidenceErr := validateDirectCompletionEvidence(document); evidenceErr != nil {
-				var err error
-				status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Direct completion rejected: "+evidenceErr.Error())
-				return status, path, err
+				note := "Direct completion rejected: " + evidenceErr.Error()
+				var credit func(map[string]any)
+				// A misshaped summary of recorded work gets one repair per attempt
+				// without spending it; a second one, or missing content, spends it.
+				attempt := numberValue(document.FrontMatter["attempt"])
+				if completionFormatOnly(evidenceErr) && attempt >= 1 && numberValue(document.FrontMatter[formatCreditAttemptField]) != attempt {
+					note += fmt.Sprintf(" Only the summary format is wrong, so the repair turn continues attempt %d; a second format rejection in this attempt spends it.", attempt)
+					credit = func(frontMatter map[string]any) {
+						frontMatter[resumeCreditField] = true
+						frontMatter[formatCreditAttemptField] = attempt
+					}
+				}
+				now := time.Now().UTC()
+				target := statusPath(base, "todo", name)
+				if err := moveDocumentWithUpdate(path, target, "todo", now, note, credit); err != nil {
+					return "todo", path, err
+				}
+				m.log(note + " " + target)
+				return "todo", target, nil
 			}
 		}
 		if status == "done" {

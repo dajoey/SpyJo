@@ -214,6 +214,12 @@ func moveDocument(path, target, status string, now time.Time) error {
 }
 
 func moveDocumentWithProgress(path, target, status string, now time.Time, note string) error {
+	return moveDocumentWithUpdate(path, target, status, now, note, nil)
+}
+
+// moveDocumentWithUpdate applies update to the front matter in the same
+// locked write that records the new status, before the rename.
+func moveDocumentWithUpdate(path, target, status string, now time.Time, note string, update func(map[string]any)) error {
 	lock, err := lockProviderTurn(path)
 	if err != nil {
 		return err
@@ -222,6 +228,9 @@ func moveDocumentWithProgress(path, target, status string, now time.Time, note s
 	document, err := ReadDocument(path)
 	if err != nil {
 		return err
+	}
+	if update != nil {
+		update(document.FrontMatter)
 	}
 	document.FrontMatter["status"] = status
 	document.FrontMatter["updated_at"] = now.UTC().Format(time.RFC3339)

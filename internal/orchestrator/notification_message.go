@@ -188,10 +188,10 @@ func validateDirectCompletionEvidence(document Document) error {
 		return diagnoseCompletionSummary(document)
 	}
 	if summary.Evidence == "" {
-		return errors.New("completion_summary.evidence must record verification and the inspected boundary")
+		return missingCompletionContent("completion_summary.evidence must record verification and the inspected boundary")
 	}
 	if summary.Uncertainty == "" {
-		return errors.New("completion_summary.uncertainty must record remaining uncertainty")
+		return missingCompletionContent("completion_summary.uncertainty must record remaining uncertainty")
 	}
 	updated, ok := timestampField(document, "updated_at")
 	if !ok {
@@ -216,11 +216,11 @@ func diagnoseCompletionSummary(document Document) error {
 		if strings.Contains(document.Body, "completion_summary:") {
 			return errors.New("completion_summary is in the Markdown body; it must be a mapping inside the YAML front matter")
 		}
-		return errors.New("completion_summary is missing from the YAML front matter")
+		return missingCompletionContent("completion_summary is missing from the YAML front matter")
 	}
 	raw, isMap := value.(map[string]any)
 	if !isMap || raw == nil {
-		return fmt.Errorf("completion_summary must be a YAML mapping of verdict/outcome/evidence/uncertainty/completed_at, found %T", value)
+		return missingCompletionContent("completion_summary must be a YAML mapping of verdict/outcome/evidence/uncertainty/completed_at, found %T", value)
 	}
 	keys := make([]string, 0, len(raw))
 	for key := range raw {
@@ -282,7 +282,7 @@ func diagnoseBoundedLine(raw map[string]any, key string, limit int, required boo
 	value, exists := raw[key]
 	if !exists {
 		if required {
-			return fmt.Errorf("completion_summary.%s is required", key)
+			return missingCompletionContent("completion_summary.%s is required", key)
 		}
 		return nil
 	}
@@ -292,7 +292,7 @@ func diagnoseBoundedLine(raw map[string]any, key string, limit int, required boo
 	}
 	text = cleanNotificationLine(text)
 	if text == "" {
-		return fmt.Errorf("completion_summary.%s must not be empty", key)
+		return missingCompletionContent("completion_summary.%s must not be empty", key)
 	}
 	if count := utf8.RuneCountInString(text); count > limit {
 		return fmt.Errorf("completion_summary.%s is %d characters; the limit is %d", key, count, limit)

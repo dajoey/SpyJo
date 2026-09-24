@@ -9,6 +9,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
 
 // testResumeCredit is the front-matter contract external resume paths read
@@ -352,5 +356,105 @@ func TestParkMadeBetweenAttemptsStillSpendsTheNextAttempt(t *testing.T) {
 	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
 	if got := numberValue(document.FrontMatter["attempt"]); got != 4 || lease.ClaimAttempt != 4 {
 		t.Fatalf("attempt = %d (lease %d), want 4", got, lease.ClaimAttempt)
+	}
+}
+
+// directDoneTurns makes implementation turn N (1-based) complete directly
+// with summaries[N-1]; a nil entry or a turn past the list leaves the task in
+// working/. updated_at and completed_at are written in one edit, as required.
+func directDoneTurns(t *testing.T, cfg config.Config, name string, summaries ...map[string]any) *fakeHarness {
+	t.Helper()
+	route := workflowRoutes()[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	fake := newFakeRecipient()
+	turn := 0
+	fake.beforeEmit = func() {
+		turn++
+		if turn > len(summaries) || summaries[turn-1] == nil {
+			return
+		}
+		working := filepath.Join(base, "working", name)
+		now := time.Now().UTC().Truncate(time.Second)
+		summary := map[string]any{}
+		for key, value := range summaries[turn-1] {
+			summary[key] = value
+		}
+		if _, ok := summary["completed_at"]; ok {
+			summary["completed_at"] = now.Format(time.RFC3339)
+		}
+		editFrontMatter(t, working, func(fm map[string]any) {
+			if len(summary) == 0 {
+				delete(fm, "completion_summary") // no summary written at all
+				return
+			}
+			fm["completion_summary"] = summary
+		})
+		if err := moveDocument(working, filepath.Join(base, "done", name), "done", now); err != nil {
+			t.Errorf("direct done: %v", err)
+		}
+	}
+	return fake
+}
+
+func noReviewTaskManager(t *testing.T, title string, summaries ...map[string]any) (config.Config, *Manager, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := CreateWithOptions(cfg, "tasks", title, "", CreateOptions{NoReview: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	fake := directDoneTurns(t, cfg, name, summaries...)
+	manager := New(cfg, fake, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	return cfg, manager, filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), name
+}
+
+func TestFormatOnlyDirectCompletionRejectionKeepsTheAttemptOnce(t *testing.T) {
+	// The work is done and recorded; only the summary's shape is wrong
+	// (2026-09-24 audit: verdict "done", a 526-char outcome, a host path).
+	// The first such rejection in an attempt is repaired without spending
+	// the attempt; a second one in the same attempt spends it as before.
+	misshaped := map[string]any{
+		"verdict": "done", "outcome": "Rotated the key and restarted the stack.",
+		"evidence": "Health endpoint returned 200.", "uncertainty": "None known.",
+		"completed_at": "",
+	}
+	_, manager, base, name := noReviewTaskManager(t, "rotate a key", misshaped, misshaped)
+
+	scanAndWait(t, manager) // attempt 1 completes directly with a misshaped summary
+	scanAndWait(t, manager) // rejected on format; the repair turn is still attempt 1
+	done, err := ReadDocument(filepath.Join(base, "done", name))
+	if err != nil {
+		t.Fatalf("repair turn did not complete again: %v", err)
+	}
+	if got := numberValue(done.FrontMatter["attempt"]); got != 1 {
+		t.Fatalf("attempt after one format-only rejection = %d, want 1", got)
+	}
+	if !strings.Contains(done.Body, `verdict must be "completed" for a direct done, found "done"`) {
+		t.Fatalf("rejection note lost the exact failing rule: %s", done.Body)
+	}
+
+	scanAndWait(t, manager) // second format rejection inside attempt 1 spends it
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 2 || lease.ClaimAttempt != 2 {
+		t.Fatalf("attempt after a repeated format rejection = %d (lease %d), want 2", got, lease.ClaimAttempt)
+	}
+}
+
+func TestSubstantiveDirectCompletionRejectionSpendsTheAttempt(t *testing.T) {
+	// No summary at all means no recorded evidence: that is incomplete work.
+	_, manager, base, name := noReviewTaskManager(t, "complete without evidence", map[string]any{})
+	scanAndWait(t, manager)
+	scanAndWait(t, manager)
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 2 || lease.ClaimAttempt != 2 {
+		t.Fatalf("attempt after a missing-evidence rejection = %d (lease %d), want 2", got, lease.ClaimAttempt)
 	}
 }

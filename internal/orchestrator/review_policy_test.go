@@ -720,69 +720,101 @@ func TestDirectCompletionRejectionNamesTheFailingRule(t *testing.T) {
 			"completed_at": "2026-08-08T12:00:00Z",
 		}
 	}
+	// format marks a misshaped record of finished work: its first rejection in
+	// an attempt is repaired without spending the attempt. Missing content is
+	// unrecorded work and spends it.
 	tests := []struct {
 		name   string
 		doc    func() Document
 		expect string
+		format bool
 	}{
 		{"summary in body", func() Document {
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z"}, Body: "## Progress\n\ncompletion_summary:\n  verdict: completed\n"}
-		}, "in the Markdown body"},
+		}, "in the Markdown body", true},
 		{"summary missing", func() Document {
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z"}}
-		}, "missing from the YAML front matter"},
+		}, "missing from the YAML front matter", false},
 		{"summary not a mapping", func() Document {
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": "done"}}
-		}, "must be a YAML mapping"},
+		}, "must be a YAML mapping", false},
 		{"unsupported key", func() Document {
 			s := valid()
 			s["notes"] = "extra"
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, `unsupported key "notes"`},
+		}, `unsupported key "notes"`, true},
 		{"uncertainty too long", func() Document {
 			s := valid()
 			s["uncertainty"] = strings.Repeat("x", notificationEvidenceRunes+1)
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "completion_summary.uncertainty is 2001 characters; the limit is 2000"},
+		}, "completion_summary.uncertainty is 2001 characters; the limit is 2000", true},
 		{"outcome too long", func() Document {
 			s := valid()
 			s["outcome"] = strings.Repeat("y", notificationOutcomeRunes+5)
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "completion_summary.outcome is 285 characters; the limit is 280"},
+		}, "completion_summary.outcome is 285 characters; the limit is 280", true},
 		{"evidence host path", func() Document {
 			s := valid()
 			s["evidence"] = "checked /home/user/ops/log"
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "completion_summary.evidence contains an absolute host path"},
+		}, "completion_summary.evidence contains an absolute host path", true},
 		{"wrong verdict", func() Document {
 			s := valid()
 			s["verdict"] = "accepted"
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, `verdict must be "completed"`},
+		}, `verdict must be "completed"`, true},
 		{"completed_at missing", func() Document {
 			s := valid()
 			delete(s, "completed_at")
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "completed_at is required"},
+		}, "completed_at is required", true},
 		{"completed_at not RFC 3339", func() Document {
 			s := valid()
 			s["completed_at"] = "2026-08-08 12:00Z"
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "is not an RFC 3339 timestamp"},
+		}, "is not an RFC 3339 timestamp", true},
 		{"non-string outcome", func() Document {
 			s := valid()
 			s["outcome"] = []any{"a", "b"}
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
-		}, "outcome must be a quoted string"},
+		}, "outcome must be a quoted string", true},
 		{"timestamp mismatch shows both values", func() Document {
 			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:07Z", "completion_summary": valid()}}
-		}, "completed_at 2026-08-08T12:00:00Z must exactly match updated_at 2026-08-08T12:00:07Z"},
+		}, "completed_at 2026-08-08T12:00:00Z must exactly match updated_at 2026-08-08T12:00:07Z", true},
+		{"verdict synonym", func() Document {
+			s := valid()
+			s["verdict"] = "done"
+			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
+		}, `found "done"`, true},
+		{"outcome missing", func() Document {
+			s := valid()
+			delete(s, "outcome")
+			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
+		}, "completion_summary.outcome is required", false},
+		{"outcome empty", func() Document {
+			s := valid()
+			s["outcome"] = "   "
+			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
+		}, "completion_summary.outcome must not be empty", false},
+		{"evidence missing", func() Document {
+			s := valid()
+			delete(s, "evidence")
+			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
+		}, "evidence must record verification", false},
+		{"uncertainty missing", func() Document {
+			s := valid()
+			delete(s, "uncertainty")
+			return Document{FrontMatter: map[string]any{"updated_at": "2026-08-08T12:00:00Z", "completion_summary": s}}
+		}, "uncertainty must record remaining uncertainty", false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := validateDirectCompletionEvidence(test.doc())
 			if err == nil || !strings.Contains(err.Error(), test.expect) {
 				t.Fatalf("error = %v, want it to contain %q", err, test.expect)
+			}
+			if got := completionFormatOnly(err); got != test.format {
+				t.Fatalf("format-only = %v, want %v for %v", got, test.format, err)
 			}
 		})
 	}
