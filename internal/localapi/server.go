@@ -343,7 +343,14 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		if handlerDone && !awaitTerminal {
 			select {
 			case event := <-events:
-				if !writeEvent(event) || event.Done && !event.Continues {
+				written := writeEvent(event)
+				if !written || event.Done && !event.Continues {
+					if !written {
+						cancel()
+					}
+					if dispatched != nil {
+						<-dispatched
+					}
 					return
 				}
 				continue
@@ -376,7 +383,14 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 		case event := <-events:
-			if !writeEvent(event) || event.Done && !event.Continues {
+			written := writeEvent(event)
+			if !written || event.Done && !event.Continues {
+				if !written {
+					cancel()
+				}
+				if dispatched != nil {
+					<-dispatched
+				}
 				return
 			}
 		case <-ctx.Done():

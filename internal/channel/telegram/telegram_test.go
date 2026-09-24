@@ -816,7 +816,7 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 	statuses := make(chan channel.ConnectionStatus, 4)
 	bot.SetStatusReporter(func(status channel.ConnectionStatus) { statuses <- status })
 	messages := make(chan core.Message, 1)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
@@ -827,12 +827,14 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 	}()
 	var detail string
 	select {
+	case err := <-done:
+		t.Fatalf("webhook bot stopped prematurely: %v", err)
 	case status := <-statuses:
 		if status.State != channel.ConnectionConnected {
 			t.Fatalf("webhook status = %#v", status)
 		}
 		detail = status.Detail
-	case <-time.After(2 * time.Second):
+	case <-t.Context().Done():
 		t.Fatal("timed out waiting for webhook listener")
 	}
 	parsed, err := url.Parse(webhookURL)
@@ -851,6 +853,7 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 	post := func(secret string) int {
 		request, _ := http.NewRequest(http.MethodPost, localURL, strings.NewReader(`{"update_id":1,"message":{"message_id":2,"from":{"id":7,"username":"trusted"},"chat":{"id":42,"type":"private"},"date":1,"text":"hello"}}`))
 		request.Header.Set("X-Telegram-Bot-Api-Secret-Token", secret)
+		request.Close = true
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -858,6 +861,7 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 		defer response.Body.Close()
 		return response.StatusCode
 	}
+	defer http.DefaultClient.CloseIdleConnections()
 	if status := post("wrong"); status != http.StatusUnauthorized {
 		t.Fatalf("wrong-secret status = %d", status)
 	}
@@ -865,17 +869,22 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 		t.Fatalf("valid webhook status = %d", status)
 	}
 	select {
+	case err := <-done:
+		t.Fatalf("webhook bot stopped before update routed: %v", err)
 	case message := <-messages:
 		if message.Text != "hello" || message.Conversation != "TG-7" {
 			t.Fatalf("webhook message = %#v", message)
 		}
-	case <-time.After(2 * time.Second):
+	case <-t.Context().Done():
 		t.Fatal("webhook update was not routed")
 	}
 	cancel()
 	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected webhook bot stop error: %v", err)
+		}
+	case <-t.Context().Done():
 		t.Fatal("webhook bot did not stop")
 	}
 }
@@ -909,10 +918,12 @@ func TestWebhookAuthorizationLossStopsListenerAndDeletesWebhook(t *testing.T) {
 	bot.SetStatusReporter(func(status channel.ConnectionStatus) { statuses <- status })
 	done := make(chan error, 1)
 	go func() {
-		done <- bot.Run(context.Background(), func(context.Context, core.Message, core.Emit) error { return nil })
+		done <- bot.Run(t.Context(), func(context.Context, core.Message, core.Emit) error { return nil })
 	}()
 	var localURL string
 	select {
+	case err := <-done:
+		t.Fatalf("webhook bot stopped prematurely: %v", err)
 	case status := <-statuses:
 		if status.State != channel.ConnectionConnected {
 			t.Fatalf("webhook status = %#v", status)
@@ -927,17 +938,19 @@ func TestWebhookAuthorizationLossStopsListenerAndDeletesWebhook(t *testing.T) {
 			t.Fatalf("webhook status detail = %q", status.Detail)
 		}
 		localURL = "http://" + status.Detail[index+len(marker):] + parsed.Path
-	case <-time.After(2 * time.Second):
+	case <-t.Context().Done():
 		t.Fatal("timed out waiting for webhook listener")
 	}
 	allowed = nil
 	request, _ := http.NewRequest(http.MethodPost, localURL, strings.NewReader(`{"update_id":1,"message":{"message_id":2,"from":{"id":7},"chat":{"id":7,"type":"private"},"text":"blocked"}}`))
 	request.Header.Set("X-Telegram-Bot-Api-Secret-Token", "secret")
+	request.Close = true
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
+	defer http.DefaultClient.CloseIdleConnections()
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("revoked webhook status = %d", response.StatusCode)
 	}
@@ -946,7 +959,7 @@ func TestWebhookAuthorizationLossStopsListenerAndDeletesWebhook(t *testing.T) {
 		if !errors.Is(err, errTelegramRuntimeAuthorization) {
 			t.Fatalf("webhook Run() error = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-t.Context().Done():
 		t.Fatal("revoked webhook listener did not stop")
 	}
 	if deletes.Load() != 1 {

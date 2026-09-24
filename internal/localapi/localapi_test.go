@@ -109,6 +109,7 @@ func TestUnknownEnvironmentReadinessIsBoundedAndRedacted(t *testing.T) {
 
 type apiHarness struct {
 	mu      sync.Mutex
+	wg      sync.WaitGroup
 	active  map[string]bool
 	threads map[string]string
 	keys    []string
@@ -130,7 +131,9 @@ func (h *apiHarness) Send(_ context.Context, key, _ string, emit core.Emit) (str
 	}
 	h.active[key] = true
 	h.mu.Unlock()
+	h.wg.Add(1)
 	go func() {
+		defer h.wg.Done()
 		time.Sleep(5 * time.Millisecond)
 		h.mu.Lock()
 		delete(h.active, key)
@@ -157,7 +160,10 @@ func (h *apiHarness) IsActive(key string) bool {
 	defer h.mu.Unlock()
 	return h.active[key]
 }
-func (h *apiHarness) Close() error { return nil }
+func (h *apiHarness) Close() error {
+	h.wg.Wait()
+	return nil
+}
 
 func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 	state := t.TempDir()

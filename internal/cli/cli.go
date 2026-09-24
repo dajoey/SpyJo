@@ -1071,6 +1071,11 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 					awaitTerminal = true
 				}
 				if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+					if dispatched != nil {
+						if dispatchErr := <-dispatched; dispatchErr != nil && err == nil {
+							err = dispatchErr
+						}
+					}
 					return err
 				}
 				continue
@@ -1096,6 +1101,11 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 				awaitTerminal = true
 			}
 			if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+				if dispatched != nil {
+					if dispatchErr := <-dispatched; dispatchErr != nil && err == nil {
+						err = dispatchErr
+					}
+				}
 				return err
 			}
 		case <-ctx.Done():

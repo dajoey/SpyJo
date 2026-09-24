@@ -1924,7 +1924,7 @@ func TestHeaderShowsRuntimeStatusAndFooterOnlyShowsControls(t *testing.T) {
 	}
 
 	m.connection["telegram"] = channel.ConnectionStatus{Name: "telegram", State: channel.ConnectionUnconfigured}
-	if view := m.View(); !strings.Contains(view, "○ TG") {
+	if view := ansi.Strip(m.View()); !strings.Contains(view, "○ TG") {
 		t.Fatalf("unconfigured Telegram icon is missing: %q", view)
 	}
 }
@@ -2073,7 +2073,7 @@ func TestRuntimeEventUpdatesHeaderCounts(t *testing.T) {
 	m.durableWork = core.DurableWorkCounts{Goals: 2, Tasks: 1}
 	next, _ := m.Update(runtimeEvent{status: core.RuntimeStatus{Logs: 12, Jobs: 4}})
 	got := next.(model)
-	if view := got.View(); !strings.Contains(view, "2 goals▀▀1 task▀▀4 jobs▀▀12 logs") || strings.Contains(view, "Log (") || strings.Contains(view, "/jobs") {
+	if view := ansi.Strip(got.View()); !strings.Contains(view, "2 goals▀▀1 task▀▀4 jobs▀▀12 logs") || strings.Contains(view, "Log (") || strings.Contains(view, "/jobs") {
 		t.Fatalf("runtime status counts are missing or misplaced: %q", view)
 	}
 }

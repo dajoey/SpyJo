@@ -39,9 +39,20 @@ func (l *privateSocket) Close() error {
 }
 
 func removeOwnedFile(path string, owned os.FileInfo) {
-	if current, err := os.Lstat(path); err == nil && owned != nil && os.SameFile(current, owned) {
-		_ = os.Remove(path)
+	if owned == nil {
+		return
 	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return
+	}
+	if !os.SameFile(current, owned) {
+		return
+	}
+	if current.Mode().Type() != owned.Mode().Type() || current.Size() != owned.Size() || !current.ModTime().Equal(owned.ModTime()) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 func validateSocketDirectory(path string) error {
@@ -85,12 +96,12 @@ func ListenSocket(path, root, token string) (net.Listener, error) {
 	}
 	listener.SetUnlinkOnClose(false)
 	owned := &privateSocket{Listener: listener, path: path}
-	owned.socketInfo, err = os.Lstat(path)
-	if err != nil {
+	if err = os.Chmod(path, 0o600); err != nil {
 		_ = owned.Close()
 		return nil, err
 	}
-	if err = os.Chmod(path, 0o600); err != nil {
+	owned.socketInfo, err = os.Lstat(path)
+	if err != nil {
 		_ = owned.Close()
 		return nil, err
 	}

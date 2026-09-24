@@ -944,6 +944,9 @@ func (r *Runtime) Close() {
 				}
 			}
 		}
+		if r.archive != nil {
+			r.archive.close()
+		}
 	})
 }
 
