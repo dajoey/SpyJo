@@ -199,10 +199,13 @@ func claimDocumentWithWriter(source, target, status, attemptField string, now ti
 	if first, ok := frontMatterTime(document.FrontMatter["first_assigned_at"]); !ok || first.After(now) {
 		document.FrontMatter["first_assigned_at"] = now.UTC().Format(time.RFC3339)
 	}
-	attempt, credited := claimAttempt(document.FrontMatter, attemptField)
+	attempt, credit := claimAttempt(document.FrontMatter, attemptField)
 	document.FrontMatter[attemptField] = attempt
-	if credited {
+	switch credit {
+	case claimCreditHonoured:
 		appendProgress(&document, now, resumeCreditNote(attempt))
+	case claimCreditExhausted:
+		appendProgress(&document, now, resumeCreditExhaustedNote(attempt))
 	}
 	if err := write(target, document); err != nil {
 		return Document{}, err

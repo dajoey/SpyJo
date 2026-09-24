@@ -329,6 +329,9 @@ func TestCreditedClaimInterruptedAfterRenameIsNotCreditedTwice(t *testing.T) {
 	if _, present := document.FrontMatter[testResumeCredit]; present {
 		t.Fatalf("%s survived a recovered claim: %#v", testResumeCredit, document.FrontMatter)
 	}
+	if numberValue(document.FrontMatter[testCreditsUsed]) != 1 || numberValue(document.FrontMatter[testCreditsAttempt]) != 1 {
+		t.Fatalf("recovered credited claim did not use the budget: %#v", document.FrontMatter)
+	}
 }
 
 func TestParkMadeBetweenAttemptsStillSpendsTheNextAttempt(t *testing.T) {
@@ -456,5 +459,125 @@ func TestSubstantiveDirectCompletionRejectionSpendsTheAttempt(t *testing.T) {
 	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
 	if got := numberValue(document.FrontMatter["attempt"]); got != 2 || lease.ClaimAttempt != 2 {
 		t.Fatalf("attempt after a missing-evidence rejection = %d (lease %d), want 2", got, lease.ClaimAttempt)
+	}
+}
+
+// The credit budget: a task that keeps re-parking on a clock inside one
+// attempt must still reach the ladder and the cap eventually.
+const (
+	testCreditsUsed    = "resume_credits_used"
+	testCreditsAttempt = "resume_credits_attempt"
+)
+
+// parkEveryTurn makes every implementation turn park its task on a wake_at
+// that is already due, so each scan reconciles, wakes, and re-claims it.
+func parkEveryTurn(t *testing.T, fake *fakeHarness, base, name string) {
+	fake.beforeEmit = func() {
+		working := filepath.Join(base, "working", name)
+		if _, err := os.Stat(working); err != nil {
+			return
+		}
+		editFrontMatter(t, working, func(fm map[string]any) {
+			fm["waiting_for"] = "the upstream release"
+			fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		})
+		if err := moveDocument(working, filepath.Join(base, "waiting", name), "waiting", time.Now().UTC()); err != nil {
+			t.Errorf("park: %v", err)
+		}
+	}
+}
+
+func TestResumeCreditBudgetIsFiveParksPerAttempt(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "re-parks on a clock forever", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	waiting := filepath.Join(base, "waiting", name)
+	parkEveryTurn(t, fake, base, name)
+
+	scanAndWait(t, manager) // attempt 1 runs and parks
+	for honoured := 1; honoured <= 5; honoured++ {
+		scanAndWait(t, manager) // wake, credited claim, park again
+		document, err := ReadDocument(waiting)
+		if err != nil {
+			t.Fatalf("resume %d: %v", honoured, err)
+		}
+		if got := numberValue(document.FrontMatter["attempt"]); got != 1 {
+			t.Fatalf("resume %d: attempt = %d, want 1 while the budget lasts", honoured, got)
+		}
+		if got := numberValue(document.FrontMatter[testCreditsUsed]); got != honoured || numberValue(document.FrontMatter[testCreditsAttempt]) != 1 {
+			t.Fatalf("resume %d: credits used = %v for attempt %v, want %d for attempt 1", honoured, document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt], honoured)
+		}
+	}
+	scanAndWait(t, manager) // sixth resume in attempt 1: not honoured
+	document, err := ReadDocument(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(document.FrontMatter["attempt"]); got != 2 {
+		t.Fatalf("sixth resume in one attempt: attempt = %d, want 2", got)
+	}
+	if !strings.Contains(document.Body, "5 parks in one attempt; this claim spends attempt 2") {
+		t.Fatalf("exhausted budget was not journaled: %s", document.Body)
+	}
+
+	scanAndWait(t, manager) // attempt 2 has a fresh budget
+	document, err = ReadDocument(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(document.FrontMatter["attempt"]); got != 2 || numberValue(document.FrontMatter[testCreditsUsed]) != 1 || numberValue(document.FrontMatter[testCreditsAttempt]) != 2 {
+		t.Fatalf("attempt 2 budget = attempt %v, used %v for attempt %v; want 2, 1, 2", document.FrontMatter["attempt"], document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt])
+	}
+}
+
+func TestResumeCreditBudgetResetsOnAGenuineNewAttempt(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "exhausted budget, then real rework", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	// Attempt 1 used its whole budget, then its work came back incomplete.
+	editFrontMatter(t, task, func(fm map[string]any) {
+		fm["attempt"] = 1
+		fm[testCreditsAttempt] = 1
+		fm[testCreditsUsed] = 5
+	})
+	parkEveryTurn(t, fake, base, name)
+	scanAndWait(t, manager) // genuine claim: attempt 2, which parks
+	scanAndWait(t, manager) // its park is honoured from a fresh budget
+	document, err := ReadDocument(filepath.Join(base, "waiting", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := numberValue(document.FrontMatter["attempt"]); got != 2 {
+		t.Fatalf("attempt = %d, want 2 (one genuine new attempt, then a credited resume)", got)
+	}
+	if numberValue(document.FrontMatter[testCreditsUsed]) != 1 || numberValue(document.FrontMatter[testCreditsAttempt]) != 2 {
+		t.Fatalf("budget did not reset: used %v for attempt %v, want 1 for attempt 2", document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt])
+	}
+}
+
+func TestFormatOnlyRepairSpendsTheSameCreditBudget(t *testing.T) {
+	misshaped := map[string]any{
+		"verdict": "complete", "outcome": "Rotated the key.", "evidence": "Health 200.",
+		"uncertainty": "None known.", "completed_at": "",
+	}
+	_, manager, base, name := noReviewTaskManager(t, "format repair counts", misshaped)
+	scanAndWait(t, manager) // attempt 1 completes with a misshaped summary
+	scanAndWait(t, manager) // format-only repair claim, still attempt 1
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if numberValue(document.FrontMatter["attempt"]) != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("attempt = %v (lease %d), want 1", document.FrontMatter["attempt"], lease.ClaimAttempt)
+	}
+	if numberValue(document.FrontMatter[testCreditsUsed]) != 1 || numberValue(document.FrontMatter[testCreditsAttempt]) != 1 {
+		t.Fatalf("format repair did not use the budget: used %v for attempt %v", document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt])
 	}
 }

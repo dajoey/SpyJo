@@ -1272,10 +1272,13 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			if first, ok := frontMatterTime(document.FrontMatter["first_assigned_at"]); !ok || first.After(lease.StartedAt) {
 				document.FrontMatter["first_assigned_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
 			}
+			// A claim whose write never landed left the credit in place. The
+			// journaled attempt was computed from it, so apply the same rule
+			// here to record it against the attempt's budget and remove it.
+			if _, marked := document.FrontMatter[resumeCreditField]; marked {
+				claimAttempt(document.FrontMatter, field)
+			}
 			document.FrontMatter[field] = attempt
-			// The journaled attempt already accounts for any resume credit; a
-			// claim whose write never landed must not leave it for a later claim.
-			delete(document.FrontMatter, resumeCreditField)
 			if err := WriteDocument(lease.File, document); err != nil {
 				return err
 			}

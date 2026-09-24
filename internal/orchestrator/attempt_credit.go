@@ -27,24 +27,60 @@ const resumeCreditField = "resume_credit"
 // format-only repair, so a summary the same attempt cannot fix still spends it.
 const formatCreditAttemptField = "format_credit_attempt"
 
+// resumeCreditsAttemptField and resumeCreditsUsedField count the credits
+// honoured within one attempt. The count belongs to the attempt recorded
+// beside it, so it starts over whenever the attempt number changes.
+const (
+	resumeCreditsAttemptField = "resume_credits_attempt"
+	resumeCreditsUsedField    = "resume_credits_used"
+	// maxResumeCreditsPerAttempt bounds a task that re-parks on a clock (or
+	// keeps failing only on summary format) inside one attempt: after this
+	// many continued claims the next one spends the attempt, so the ladder and
+	// the attempt cap still reach Joey.
+	maxResumeCreditsPerAttempt = 5
+)
+
+type claimCredit int
+
+const (
+	claimCreditNone claimCredit = iota
+	claimCreditHonoured
+	claimCreditExhausted
+)
+
 // claimAttempt returns the attempt a claim records for field and whether a
-// resume credit was honoured. It always removes the credit from frontMatter.
+// resume credit was honoured, or refused because this attempt already used
+// its budget. It always removes the credit from frontMatter and records an
+// honoured credit against the attempt's budget.
 // Only the task implementation attempt is credited: goal planning and review
 // counters feed neither the ladder nor the cap, and a goal may resume into a
 // different phase than the one that parked, which would reuse an unrelated
 // dispatch's session.
-func claimAttempt(frontMatter map[string]any, field string) (int, bool) {
+func claimAttempt(frontMatter map[string]any, field string) (int, claimCredit) {
 	current := numberValue(frontMatter[field])
 	credit, _ := frontMatter[resumeCreditField].(bool)
 	delete(frontMatter, resumeCreditField)
-	if credit && field == phaseAttemptField(phaseTaskImplementation) && current >= 1 {
-		return current, true
+	if !credit || field != phaseAttemptField(phaseTaskImplementation) || current < 1 {
+		return current + 1, claimCreditNone
 	}
-	return current + 1, false
+	used := 0
+	if numberValue(frontMatter[resumeCreditsAttemptField]) == current {
+		used = numberValue(frontMatter[resumeCreditsUsedField])
+	}
+	if used >= maxResumeCreditsPerAttempt {
+		return current + 1, claimCreditExhausted
+	}
+	frontMatter[resumeCreditsAttemptField] = current
+	frontMatter[resumeCreditsUsedField] = used + 1
+	return current, claimCreditHonoured
 }
 
 func resumeCreditNote(attempt int) string {
 	return fmt.Sprintf("Spynel continued attempt %d instead of starting attempt %d: the previous turn parked this task or was rejected only on completion_summary format, and neither is a failed attempt; attempt not spent.", attempt, attempt+1)
+}
+
+func resumeCreditExhaustedNote(attempt int) string {
+	return fmt.Sprintf("Spynel did not continue attempt %d: %d parks in one attempt; this claim spends attempt %d. Parks and format-only repairs share a budget of %d continued claims per attempt so a task that keeps re-parking still reaches the escalation ladder and the attempt cap.", attempt-1, maxResumeCreditsPerAttempt, attempt, maxResumeCreditsPerAttempt)
 }
 
 // setResumeCredit writes or removes the mark under the provider-turn lock. It
