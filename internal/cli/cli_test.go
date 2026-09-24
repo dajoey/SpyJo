@@ -1740,3 +1740,105 @@ func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
 		t.Fatal("ignored check suppression")
 	}
 }
+
+func TestTaskGoalCreateGuardsHelpFlagsAndReadonlyAliases(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+
+	countDocs := func() int {
+		total := 0
+		for _, route := range []string{"tasks", "goals"} {
+			base := filepath.Join(root, ".spynel", route)
+			_ = filepath.WalkDir(base, func(path string, d os.DirEntry, walkErr error) error {
+				if walkErr != nil || d.IsDir() {
+					return walkErr
+				}
+				if strings.HasSuffix(path, ".md") {
+					total++
+				}
+				return nil
+			})
+		}
+		return total
+	}
+
+	captureStdout := func(fn func() error) (string, error) {
+		old := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout = w
+		runErr := fn()
+		_ = w.Close()
+		os.Stdout = old
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(r)
+		_ = r.Close()
+		return buf.String(), runErr
+	}
+
+	before := countDocs()
+	for _, test := range []struct {
+		name       string
+		args       []string
+		wantErr    string
+		wantOut    string
+		wantCreate bool
+	}{
+		{name: "task --help", args: []string{"task", "--help"}, wantOut: "usage: spyjo task [--no-review] <request>"},
+		{name: "task -h", args: []string{"task", "-h"}, wantOut: "usage: spyjo task [--no-review] <request>"},
+		{name: "task help", args: []string{"task", "help"}, wantOut: "usage: spyjo task [--no-review] <request>"},
+		{name: "goal --help", args: []string{"goal", "--help"}, wantOut: "usage: spyjo goal [--no-review] <request>"},
+		{name: "task --bogus", args: []string{"task", "--bogus"}, wantErr: `unknown flag "--bogus"; usage: spyjo task [--no-review] <request>`},
+		{name: "task list", args: []string{"task", "list"}, wantErr: "did you mean `spyjo tasks`?"},
+		{name: "task status id", args: []string{"task", "status", "tasks-20260921-example"}, wantErr: "did you mean `spyjo tasks tasks-20260921-example`?"},
+		{name: "no-review --help", args: []string{"task", "--no-review", "--help"}, wantOut: "usage: spyjo task [--no-review] <request>"},
+		{name: "multi-word list request", args: []string{"task", "list", "the", "stale", "leases", "in", "waiting/"}, wantCreate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := countDocs()
+			out, err := captureStdout(func() error {
+				return run(test.args, "test")
+			})
+			created := countDocs() - started
+			if test.wantCreate {
+				if err != nil {
+					t.Fatalf("create error = %v", err)
+				}
+				if created != 1 {
+					t.Fatalf("created %d docs, want 1; stdout=%q", created, out)
+				}
+				return
+			}
+			if created != 0 {
+				t.Fatalf("created %d docs, want 0; stdout=%q err=%v", created, out, err)
+			}
+			if test.wantOut != "" {
+				if err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
+				if !strings.Contains(out, test.wantOut) {
+					t.Fatalf("stdout = %q, want containing %q", out, test.wantOut)
+				}
+				return
+			}
+			if err == nil || err.Error() != test.wantErr {
+				t.Fatalf("error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+	if countDocs()-before != 1 {
+		t.Fatalf("net docs created across cases = %d, want 1", countDocs()-before)
+	}
+}

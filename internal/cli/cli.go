@@ -256,37 +256,7 @@ func run(args []string, version string) error {
 			}
 			return inspectTaskPolicy(args[2], os.Stdout)
 		}
-		noReview := false
-		requestArgs := args[1:]
-		if len(requestArgs) > 0 && requestArgs[0] == "--no-review" && args[0] != "goal" {
-			noReview = true
-			requestArgs = requestArgs[1:]
-		}
-		if len(requestArgs) == 0 {
-			return fmt.Errorf("usage: spyjo %s [--no-review] <request>", args[0])
-		}
-		cfg, err := config.Load("")
-		if err != nil {
-			return err
-		}
-		route := "tasks"
-		if args[0] == "goal" {
-			route = "goals"
-		}
-		request := strings.Join(requestArgs, " ")
-		if route == "tasks" {
-			_, _ = history.New(cfg.StatePath("history")).Append("cli", "local", history.Entry{Role: "user", Sender: "cli", Content: "/task " + request})
-		}
-		options := orchestrator.CreateOptions{}
-		if route == "tasks" {
-			options = orchestrator.CreateOptions{Notify: true, Origin: "cli/local", Outcomes: []string{"done", "failed", "waiting", "cancelled"}, NoReview: noReview}
-		}
-		path, err := orchestrator.CreateWithOptions(cfg, route, request, "", options)
-		if err != nil {
-			return err
-		}
-		fmt.Println(path)
-		return nil
+		return runTaskOrGoalCreate(args[0], args[1:])
 	case "config":
 		if len(args) > 1 {
 			return runFrameworkCLICommand("config", args[1:], version)
@@ -308,6 +278,82 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("whatsapp", args[1:], version)
 	default:
 		return fmt.Errorf("unknown command %q; run 'spynel help'", args[0])
+	}
+}
+
+// runTaskOrGoalCreate creates a task or goal from a free-text request. Help flags,
+// unknown dashes, and lone read-only aliases (list/status/…) must never create work.
+func runTaskOrGoalCreate(command string, requestArgs []string) error {
+	usage := fmt.Sprintf("usage: spyjo %s [--no-review] <request>", command)
+	noReview := false
+	if len(requestArgs) > 0 && requestArgs[0] == "--no-review" && command != "goal" {
+		noReview = true
+		requestArgs = requestArgs[1:]
+	}
+	if len(requestArgs) == 0 {
+		return errors.New(usage)
+	}
+	switch requestArgs[0] {
+	case "-h", "--help", "help":
+		fmt.Println(usage)
+		return nil
+	}
+	if strings.HasPrefix(requestArgs[0], "-") {
+		return fmt.Errorf("unknown flag %q; %s", requestArgs[0], usage)
+	}
+	if plural, rest, ok := taskGoalReadonlyAlias(command, requestArgs); ok {
+		suggested := "spyjo " + plural
+		if len(rest) > 0 {
+			suggested += " " + strings.Join(rest, " ")
+		}
+		return fmt.Errorf("did you mean `%s`?", suggested)
+	}
+	cfg, err := config.Load("")
+	if err != nil {
+		return err
+	}
+	route := "tasks"
+	if command == "goal" {
+		route = "goals"
+	}
+	request := strings.Join(requestArgs, " ")
+	if route == "tasks" {
+		_, _ = history.New(cfg.StatePath("history")).Append("cli", "local", history.Entry{Role: "user", Sender: "cli", Content: "/task " + request})
+	}
+	options := orchestrator.CreateOptions{}
+	if route == "tasks" {
+		options = orchestrator.CreateOptions{Notify: true, Origin: "cli/local", Outcomes: []string{"done", "failed", "waiting", "cancelled"}, NoReview: noReview}
+	}
+	path, err := orchestrator.CreateWithOptions(cfg, route, request, "", options)
+	if err != nil {
+		return err
+	}
+	fmt.Println(path)
+	return nil
+}
+
+func taskGoalReadonlyAlias(command string, requestArgs []string) (plural string, rest []string, ok bool) {
+	switch requestArgs[0] {
+	case "list", "ls", "status", "show":
+	default:
+		return "", nil, false
+	}
+	plural = "tasks"
+	idPrefix := "tasks-"
+	if command == "goal" {
+		plural = "goals"
+		idPrefix = "goals-"
+	}
+	switch len(requestArgs) {
+	case 1:
+		return plural, nil, true
+	case 2:
+		if strings.HasPrefix(requestArgs[1], idPrefix) {
+			return plural, requestArgs[1:], true
+		}
+		return "", nil, false
+	default:
+		return "", nil, false
 	}
 }
 
