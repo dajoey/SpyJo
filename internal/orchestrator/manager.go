@@ -29,23 +29,27 @@ import (
 )
 
 type Lease struct {
-	ID                     string          `json:"id"`
-	ClaimID                string          `json:"claim_id,omitempty"`
-	DocumentType           string          `json:"document_type,omitempty"`
-	OwnerID                string          `json:"owner_id,omitempty"`
-	Route                  string          `json:"route"`
-	File                   string          `json:"file"`
-	SourceFile             string          `json:"source_file,omitempty"`
-	SessionKey             string          `json:"session_key"`
-	ThreadID               string          `json:"thread_id,omitempty"`
-	State                  string          `json:"state"`
-	StartedAt              time.Time       `json:"started_at"`
-	HeartbeatAt            time.Time       `json:"heartbeat_at"`
-	RecoveryCount          int             `json:"recovery_count"`
-	LastError              string          `json:"last_error,omitempty"`
-	Phase                  string          `json:"phase,omitempty"`
-	ClaimAttempt           int             `json:"claim_attempt,omitempty"`
-	ImplementerThread      string          `json:"implementer_thread,omitempty"`
+	ID                string    `json:"id"`
+	ClaimID           string    `json:"claim_id,omitempty"`
+	DocumentType      string    `json:"document_type,omitempty"`
+	OwnerID           string    `json:"owner_id,omitempty"`
+	Route             string    `json:"route"`
+	File              string    `json:"file"`
+	SourceFile        string    `json:"source_file,omitempty"`
+	SessionKey        string    `json:"session_key"`
+	ThreadID          string    `json:"thread_id,omitempty"`
+	State             string    `json:"state"`
+	StartedAt         time.Time `json:"started_at"`
+	HeartbeatAt       time.Time `json:"heartbeat_at"`
+	RecoveryCount     int       `json:"recovery_count"`
+	LastError         string    `json:"last_error,omitempty"`
+	Phase             string    `json:"phase,omitempty"`
+	ClaimAttempt      int       `json:"claim_attempt,omitempty"`
+	ImplementerThread string    `json:"implementer_thread,omitempty"`
+	// ReviewRisk is the task's risk when Spynel claimed it for review:
+	// reviewRiskHigh or reviewRiskRoutine. Empty means unknown (an older
+	// lease, or a review adopted without a claim) and never earns a credit.
+	ReviewRisk             string          `json:"review_risk,omitempty"`
 	TerminalHooksCompleted map[string]bool `json:"terminal_hooks_completed,omitempty"`
 }
 
@@ -585,6 +589,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		}
 		if phase == phaseTaskReview {
 			lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
+			lease.ReviewRisk = reviewRiskAtClaim(document)
 		}
 		if err := m.saveLease(lease); err != nil {
 			return err
@@ -1116,6 +1121,13 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 	if status != "waiting" {
 		m.finalizeTaskCompletionSummary(path, status)
 	} else {
+		m.grantParkCredit(path)
+	}
+	if status == "todo" && lease.ReviewRisk == reviewRiskRoutine && taskRiskHigh(path) {
+		// A routine reviewer that finds the task should have been risk: high
+		// gives no verdict, stamps the risk, and returns it for the risk-high
+		// reviewer. That hand-off is not rework, and it can only make review
+		// stricter, so the implementer's pass-through continues the attempt.
 		m.grantParkCredit(path)
 	}
 	if status == "done" || status == "waiting" {

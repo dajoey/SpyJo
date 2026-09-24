@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // resumeCreditField marks a task whose last implementation attempt ended
@@ -76,7 +77,26 @@ func claimAttempt(frontMatter map[string]any, field string) (int, claimCredit) {
 }
 
 func resumeCreditNote(attempt int) string {
-	return fmt.Sprintf("Spynel continued attempt %d instead of starting attempt %d: the previous turn parked this task or was rejected only on completion_summary format, and neither is a failed attempt; attempt not spent.", attempt, attempt+1)
+	return fmt.Sprintf("Spynel continued attempt %d instead of starting attempt %d: the previous turn parked this task, handed it to the risk-high reviewer, or was rejected only on completion_summary format, and none of those is a failed attempt; attempt not spent.", attempt, attempt+1)
+}
+
+const (
+	reviewRiskHigh    = "high"
+	reviewRiskRoutine = "routine"
+)
+
+// reviewRiskAtClaim records the risk a review started from. It uses the same
+// reading as roster routing, which sends risk: high to the risk-high reviewer.
+func reviewRiskAtClaim(document Document) string {
+	if risk, _ := document.FrontMatter["risk"].(string); strings.EqualFold(strings.TrimSpace(risk), "high") {
+		return reviewRiskHigh
+	}
+	return reviewRiskRoutine
+}
+
+func taskRiskHigh(path string) bool {
+	document, err := ReadDocument(path)
+	return err == nil && reviewRiskAtClaim(document) == reviewRiskHigh
 }
 
 func resumeCreditExhaustedNote(attempt int) string {

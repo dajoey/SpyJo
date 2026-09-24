@@ -581,3 +581,83 @@ func TestFormatOnlyRepairSpendsTheSameCreditBudget(t *testing.T) {
 		t.Fatalf("format repair did not use the budget: used %v for attempt %v", document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt])
 	}
 }
+
+// reviewTurns drives implementation -> review, then lets review do reviewer.
+func reviewTurns(t *testing.T, fake *fakeHarness, base, name string, reviewer func(reviewing string)) {
+	turn := 0
+	fake.beforeEmit = func() {
+		turn++
+		switch turn {
+		case 1:
+			_ = moveDocument(filepath.Join(base, "working", name), filepath.Join(base, "review", name), "review", time.Now().UTC())
+		case 2:
+			reviewer(filepath.Join(base, "reviewing", name))
+		}
+	}
+}
+
+func TestRiskHighReviewHandOffKeepsTheAttempt(t *testing.T) {
+	// A routine reviewer that finds the task should have been risk: high gives
+	// no verdict: it stamps the risk and returns the task so the implementer
+	// can hand it straight to the risk-high reviewer. Nothing was reworked
+	// (2026-09-24: tasks-20260924-daily-report-factcheck-drops-real-times went
+	// 1 -> 2 on the hand-off and hit the top rung early).
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "changes what Joey reads", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	reviewTurns(t, fake, base, name, func(reviewing string) {
+		editFrontMatter(t, reviewing, func(fm map[string]any) { fm["risk"] = "high" })
+		_ = moveDocumentWithProgress(reviewing, filepath.Join(base, "todo", name), "todo", time.Now().UTC(), "no rework: needs the risk-high reviewer (criterion 3)")
+	})
+	for scan := 0; scan < 3; scan++ {
+		scanAndWait(t, manager)
+	}
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("attempt after a risk-high hand-off = %d (lease %d), want 1", got, lease.ClaimAttempt)
+	}
+	if numberValue(document.FrontMatter[testCreditsUsed]) != 1 || numberValue(document.FrontMatter[testCreditsAttempt]) != 1 {
+		t.Fatalf("hand-off did not use the credit budget: used %v for attempt %v", document.FrontMatter[testCreditsUsed], document.FrontMatter[testCreditsAttempt])
+	}
+}
+
+func TestReviewRejectionWithoutARiskEscalationStillSpendsTheAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		initialRisk string
+	}{
+		{name: "routine rejection, risk unchanged"},
+		// Already high before review: the reviewer rejecting it did not raise
+		// anything, so this is ordinary rework.
+		{name: "risk-high rejection", initialRisk: "high"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, fake, manager := workflowTestManager(t)
+			route := workflowRoutes()[0]
+			task, err := Create(cfg, "tasks", "reviewer finds real defects", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.initialRisk != "" {
+				editFrontMatter(t, task, func(fm map[string]any) { fm["risk"] = test.initialRisk })
+			}
+			name := filepath.Base(task)
+			base := filepath.Dir(cfg.Resolve(route.Source))
+			reviewTurns(t, fake, base, name, func(reviewing string) {
+				_ = moveDocumentWithProgress(reviewing, filepath.Join(base, "todo", name), "todo", time.Now().UTC(), "rejected: criterion 2 fails")
+			})
+			for scan := 0; scan < 3; scan++ {
+				scanAndWait(t, manager)
+			}
+			document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+			if got := numberValue(document.FrontMatter["attempt"]); got != 2 || lease.ClaimAttempt != 2 {
+				t.Fatalf("attempt after a review rejection = %d (lease %d), want 2", got, lease.ClaimAttempt)
+			}
+		})
+	}
+}
