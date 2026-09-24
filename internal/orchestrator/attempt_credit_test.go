@@ -1,0 +1,356 @@
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// testResumeCredit is the front-matter contract external resume paths read
+// about; spelled out so these tests also compile against a tree without it.
+const testResumeCredit = "resume_credit"
+
+// A task's `attempt` feeds both the roster escalation ladder and the fleet's
+// attempt cap. On 2026-09-24, 30 of 40 ops tasks with attempt>1 had climbed
+// through a park (a wake_at timer or a Helm question) or a restart, and only
+// five through a genuine model failure. These tests pin the accounting rule:
+// a park that an agent turn ended in is not a failed attempt, so the claim
+// that resumes it continues the same attempt; anything else still spends one.
+
+func editFrontMatter(t *testing.T, path string, edit func(map[string]any)) {
+	t.Helper()
+	document, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit(document.FrontMatter)
+	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func scanAndWait(t *testing.T, manager *Manager) {
+	t.Helper()
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+}
+
+func claimedAttempt(t *testing.T, manager *Manager, working string) (Document, Lease) {
+	t.Helper()
+	document, err := ReadDocument(working)
+	if err != nil {
+		t.Fatalf("task was not claimed back into working/: %v", err)
+	}
+	leases, err := manager.loadLeases()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lease := range leases {
+		if filepath.Clean(lease.File) == filepath.Clean(working) {
+			return document, lease
+		}
+	}
+	t.Fatalf("no lease owns %s: %#v", working, leases)
+	return Document{}, Lease{}
+}
+
+// parkDuringTurn makes the first implementation turn park its task in
+// waiting/, the way an agent does: front matter first, then the move.
+func parkDuringTurn(t *testing.T, fake *fakeHarness, base, name string, edit func(map[string]any)) {
+	var once sync.Once
+	fake.beforeEmit = func() {
+		once.Do(func() {
+			working := filepath.Join(base, "working", name)
+			editFrontMatter(t, working, edit)
+			if err := moveDocument(working, filepath.Join(base, "waiting", name), "waiting", time.Now().UTC()); err != nil {
+				t.Errorf("park: %v", err)
+			}
+		})
+	}
+}
+
+// resumeLikeParksPump reproduces ~/ops/spyjo_parks.py move_item on a Joey
+// answer: it rewrites the front matter it read (dropping the park keys and
+// keeping every other field verbatim), then renames waiting/ -> todo/.
+func resumeLikeParksPump(t *testing.T, base, name string) {
+	t.Helper()
+	waiting := filepath.Join(base, "waiting", name)
+	editFrontMatter(t, waiting, func(fm map[string]any) {
+		for _, key := range []string{"joey_ask", "wake_at", "waiting_for", "completion_summary"} {
+			delete(fm, key)
+		}
+		fm["joey_answer"] = map[string]any{"value": "proceed"}
+		fm["status"] = "todo"
+	})
+	if err := os.Rename(waiting, filepath.Join(base, "todo", name)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWakeResumedParkDoesNotSpendAnAttempt(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "park on a clock and resume", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+		fm["waiting_for"] = "the nightly build to publish"
+		fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	})
+
+	scanAndWait(t, manager) // claim attempt 1; the turn parks it
+	scanAndWait(t, manager) // reconcile the park, wake it, claim it again
+
+	working := filepath.Join(base, "working", name)
+	document, lease := claimedAttempt(t, manager, working)
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 {
+		t.Fatalf("attempt after a wake-resumed park = %d, want 1 (the park is not a failed attempt)", got)
+	}
+	if lease.ClaimAttempt != 1 {
+		t.Fatalf("lease ClaimAttempt = %d, want 1", lease.ClaimAttempt)
+	}
+	if _, present := document.FrontMatter[testResumeCredit]; present {
+		t.Fatalf("%s survived the claim that consumed it: %#v", testResumeCredit, document.FrontMatter)
+	}
+	if !strings.Contains(document.Body, "scheduled wake condition became due") || !strings.Contains(document.Body, "attempt not spent") {
+		t.Fatalf("resume was not journaled as an unspent attempt: %s", document.Body)
+	}
+}
+
+func TestExternallyResumedParkDoesNotSpendAnAttempt(t *testing.T) {
+	// Joey answers the Helm question; spyjo_parks.py moves the document back
+	// to todo/. It only has to keep the front matter it did not name.
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "park on Joey and resume", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+		fm["waiting_for"] = "Joey to pick a vendor"
+		fm["joey_ask"] = map[string]any{"kind": "choice", "prompt": "Which vendor?"}
+	})
+
+	scanAndWait(t, manager) // claim attempt 1; the turn parks it on Joey
+	scanAndWait(t, manager) // reconcile the park; nothing is due
+	if _, err := os.Stat(filepath.Join(base, "waiting", name)); err != nil {
+		t.Fatalf("park on Joey did not stay in waiting/: %v", err)
+	}
+	resumeLikeParksPump(t, base, name)
+	scanAndWait(t, manager)
+
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("attempt after an answered park = %d (lease %d), want 1", got, lease.ClaimAttempt)
+	}
+	if _, present := document.FrontMatter[testResumeCredit]; present {
+		t.Fatalf("%s survived the claim that consumed it", testResumeCredit)
+	}
+}
+
+func TestReviewerParkResumesTheAcceptedImplementationAttempt(t *testing.T) {
+	// A reviewer that accepts the work but needs a human confirmation parks
+	// the task instead of rejecting it; no implementation attempt failed.
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "accepted build awaiting an in-game grade", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	turn := 0
+	fake.beforeEmit = func() {
+		turn++
+		switch turn {
+		case 1: // implementation submits for review
+			_ = moveDocument(filepath.Join(base, "working", name), filepath.Join(base, "review", name), "review", time.Now().UTC())
+		case 2: // review accepts and parks on a clock
+			reviewing := filepath.Join(base, "reviewing", name)
+			editFrontMatter(t, reviewing, func(fm map[string]any) {
+				fm["waiting_for"] = "the in-game grade"
+				fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+			})
+			_ = moveDocument(reviewing, filepath.Join(base, "waiting", name), "waiting", time.Now().UTC())
+		}
+	}
+	for scan := 0; scan < 3; scan++ {
+		scanAndWait(t, manager)
+	}
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("implementation attempt after a reviewer park = %d (lease %d), want 1", got, lease.ClaimAttempt)
+	}
+	if got := numberValue(document.FrontMatter["review_attempt"]); got != 1 {
+		t.Fatalf("review_attempt = %d, want the one review that ran", got)
+	}
+}
+
+func TestRequeueAfterAWorkTurnStillSpendsAnAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		forged bool
+	}{
+		{name: "incomplete work returned to todo"},
+		// An agent turn cannot mint the credit for itself: Spynel strips it
+		// from every transition it reconciles that is not a park.
+		{name: "turn writes its own resume credit", forged: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, fake, manager := workflowTestManager(t)
+			route := workflowRoutes()[0]
+			task, err := Create(cfg, "tasks", "genuinely incomplete work", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			name := filepath.Base(task)
+			base := filepath.Dir(cfg.Resolve(route.Source))
+			var once sync.Once
+			fake.beforeEmit = func() {
+				once.Do(func() {
+					working := filepath.Join(base, "working", name)
+					if test.forged {
+						editFrontMatter(t, working, func(fm map[string]any) { fm[testResumeCredit] = true })
+					}
+					_ = moveDocument(working, filepath.Join(base, "todo", name), "todo", time.Now().UTC())
+				})
+			}
+			scanAndWait(t, manager)
+			scanAndWait(t, manager)
+			document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+			if got := numberValue(document.FrontMatter["attempt"]); got != 2 || lease.ClaimAttempt != 2 {
+				t.Fatalf("attempt after a requeue = %d (lease %d), want 2", got, lease.ClaimAttempt)
+			}
+			if strings.Contains(document.Body, "attempt not spent") {
+				t.Fatalf("a work requeue was journaled as unspent: %s", document.Body)
+			}
+		})
+	}
+}
+
+func TestResumeCreditIsConsumedByExactlyOneClaim(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "credited once", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	editFrontMatter(t, task, func(fm map[string]any) {
+		fm["attempt"] = 2
+		fm[testResumeCredit] = true
+	})
+	var once sync.Once
+	fake.beforeEmit = func() {
+		once.Do(func() {
+			_ = moveDocument(filepath.Join(base, "working", name), filepath.Join(base, "todo", name), "todo", time.Now().UTC())
+		})
+	}
+	scanAndWait(t, manager)
+	scanAndWait(t, manager)
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 3 || lease.ClaimAttempt != 3 {
+		t.Fatalf("attempt = %d (lease %d), want 3: the credited claim keeps 2, the next genuine requeue spends 3", got, lease.ClaimAttempt)
+	}
+	if strings.Count(document.Body, "attempt not spent") != 1 {
+		t.Fatalf("credit should be journaled exactly once: %s", document.Body)
+	}
+}
+
+func TestResumeCreditNeedsAnAttemptToContinue(t *testing.T) {
+	// A document that never ran has nothing to continue: attempt 0 -> 1.
+	cfg, _, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "never ran", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	editFrontMatter(t, task, func(fm map[string]any) { fm[testResumeCredit] = true })
+	scanAndWait(t, manager)
+	document, lease := claimedAttempt(t, manager, filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "working", filepath.Base(task)))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("attempt = %d (lease %d), want 1", got, lease.ClaimAttempt)
+	}
+	if _, present := document.FrontMatter[testResumeCredit]; present {
+		t.Fatalf("%s must be consumed even when it cannot be honoured", testResumeCredit)
+	}
+}
+
+func TestCreditedClaimInterruptedAfterRenameIsNotCreditedTwice(t *testing.T) {
+	// The claim renamed the document but crashed before its metadata write,
+	// so the file in working/ still carries the mark. Recovery finishes the
+	// claim from the journaled attempt and must not leave the mark behind for
+	// a later requeue to spend.
+	cfg, _, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "credited claim crashes mid-way", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	editFrontMatter(t, task, func(fm map[string]any) {
+		fm["attempt"] = 1
+		fm[testResumeCredit] = true
+	})
+	failed := false
+	manager.claimDocument = func(source, target, status, attemptField string, now time.Time) (Document, error) {
+		if !failed {
+			failed = true
+			return claimDocumentWithWriter(source, target, status, attemptField, now, func(string, Document) error {
+				return errors.New("injected metadata replacement failure")
+			})
+		}
+		return claimDocument(source, target, status, attemptField, now)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	scanAndWait(t, manager)
+	document, lease := claimedAttempt(t, manager, filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "working", filepath.Base(task)))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
+		t.Fatalf("attempt = %d (lease %d), want the credited 1", got, lease.ClaimAttempt)
+	}
+	if _, present := document.FrontMatter[testResumeCredit]; present {
+		t.Fatalf("%s survived a recovered claim: %#v", testResumeCredit, document.FrontMatter)
+	}
+}
+
+func TestParkMadeBetweenAttemptsStillSpendsTheNextAttempt(t *testing.T) {
+	// The fleet attempt cap parks a task straight out of todo/ after its third
+	// attempt already ended. That park did not interrupt an attempt, so the
+	// resume after Joey's go-ahead is a new attempt (3 -> 4).
+	cfg, _, manager := workflowTestManager(t)
+	route := workflowRoutes()[0]
+	task, err := Create(cfg, "tasks", "attempt-capped task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	editFrontMatter(t, task, func(fm map[string]any) {
+		fm["attempt"] = 3
+		fm["joey_ask"] = map[string]any{"kind": "choice", "prompt": "Used 3 attempts. What next?"}
+	})
+	if err := os.Rename(task, filepath.Join(base, "waiting", name)); err != nil {
+		t.Fatal(err)
+	}
+	scanAndWait(t, manager)
+	resumeLikeParksPump(t, base, name)
+	scanAndWait(t, manager)
+	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
+	if got := numberValue(document.FrontMatter["attempt"]); got != 4 || lease.ClaimAttempt != 4 {
+		t.Fatalf("attempt = %d (lease %d), want 4", got, lease.ClaimAttempt)
+	}
+}

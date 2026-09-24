@@ -574,7 +574,9 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		target := filepath.Join(claimedDir, entry.Name())
 		now := time.Now().UTC()
 		attemptField := phaseAttemptField(phase)
-		attempt := numberValue(document.FrontMatter[attemptField]) + 1
+		// Same rule the claim applies under the provider-turn lock below; the
+		// journaled lease must carry the attempt the document will record.
+		attempt, _ := claimAttempt(document.FrontMatter, attemptField)
 		lease := Lease{
 			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
 			OwnerID: m.ownerID,
@@ -982,6 +984,11 @@ func normalizeLeasePhase(routeName, phase string) string {
 func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRoute, lease Lease, phase, status, path string) (string, string, error) {
 	base := filepath.Dir(m.Config.Resolve(route.Source))
 	name := filepath.Base(path)
+	// Whatever this turn wrote, its transition carries no resume credit
+	// unless Spynel grants one below for a park.
+	if err := setResumeCredit(path, false); err != nil {
+		m.log("clear resume credit " + path + ": " + err.Error())
+	}
 	if phase == phaseTaskImplementation {
 		document, readErr := ReadDocument(path)
 		if readErr != nil {
@@ -1062,6 +1069,9 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 		if status == "done" {
 			m.finalizeTaskCompletionSummary(path, status)
 		}
+		if status == "waiting" {
+			m.grantParkCredit(path)
+		}
 		if status == "done" || status == "waiting" || status == "failed" || status == "cancelled" {
 			if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 				return status, path, err
@@ -1089,6 +1099,8 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 	}
 	if status != "waiting" {
 		m.finalizeTaskCompletionSummary(path, status)
+	} else {
+		m.grantParkCredit(path)
 	}
 	if status == "done" || status == "waiting" {
 		if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
@@ -1129,6 +1141,15 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route workflowRoute
 		return status, path, nil
 	}
 	return m.redirectTransition(path, statusPath(base, "review", name), "review", "Invalid goal-review transition; review must choose planning, waiting, done, or abandoned.")
+}
+
+// grantParkCredit marks a task a turn just parked in waiting/, before the
+// notification agent can read or edit it. A failed write only costs the task
+// the credit (its next claim spends an attempt, as before), so it is logged.
+func (m *Manager) grantParkCredit(path string) {
+	if err := setResumeCredit(path, true); err != nil {
+		m.log("record resume credit " + path + ": " + err.Error())
+	}
 }
 
 func (m *Manager) redirectTransition(path, target, status, note string) (string, string, error) {
@@ -1236,6 +1257,9 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 				document.FrontMatter["first_assigned_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
 			}
 			document.FrontMatter[field] = attempt
+			// The journaled attempt already accounts for any resume credit; a
+			// claim whose write never landed must not leave it for a later claim.
+			delete(document.FrontMatter, resumeCreditField)
 			if err := WriteDocument(lease.File, document); err != nil {
 				return err
 			}
