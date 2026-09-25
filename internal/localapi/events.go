@@ -30,13 +30,33 @@ type ConversationSnapshot struct {
 	Bounded bool                        `json:"bounded"`
 }
 
+// localChannelNames are the channels whose history the local API may read
+// through the events and conversation routes. Remote channels (telegram,
+// whatsapp) keep their own transport-owned views and are deliberately not
+// readable here. Default remains "cli" so every existing caller is
+// byte-identical.
+func localHistoryChannel(value string) (string, error) {
+	switch value {
+	case "":
+		return "cli", nil
+	case "cli", "tui", "web":
+		return value, nil
+	}
+	return "", errors.New("channel must be cli, tui or web")
+}
+
 func (s *Server) conversation(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("conversation")
 	if err := app.ValidateConversationName(name); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	events, cursor, err := s.Service.History.EventSnapshot("cli", name)
+	channel, err := localHistoryChannel(r.URL.Query().Get("channel"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	events, cursor, err := s.Service.History.EventSnapshot(channel, name)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, eventError(err))
 		return
@@ -64,6 +84,11 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	channel, err := localHistoryChannel(r.URL.Query().Get("channel"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if len(cursor) > 256 {
 		writeJSON(w, http.StatusBadRequest, eventError(history.ErrEventCursor))
 		return
@@ -74,7 +99,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.subscribers.Add(-1)
-	events, next, err := s.Service.History.Events("cli", conversation, cursor)
+	events, next, err := s.Service.History.Events(channel, conversation, cursor)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, eventError(err))
 		return
@@ -114,7 +139,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-ticker.C:
 		}
-		events, next, err = s.Service.History.Events("cli", conversation, cursor)
+		events, next, err = s.Service.History.Events(channel, conversation, cursor)
 		if err != nil {
 			_ = write(eventError(err))
 			return

@@ -480,7 +480,7 @@ func (s *Service) primaryInstanceID() string {
 }
 
 func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Emit) (resultErr error) {
-	if message.Channel == "cli" || message.Channel == "tui" {
+	if message.Channel == "cli" || message.Channel == "tui" || message.Channel == "web" {
 		if err := ValidateLocalMessage(message); err != nil {
 			return err
 		}
@@ -501,7 +501,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	}
 	release, err := s.admitMessage(message)
 	if err != nil {
-		if errors.Is(err, ErrDuplicateMessage) && message.Channel != "cli" && message.Channel != "tui" {
+		if errors.Is(err, ErrDuplicateMessage) && message.Channel != "cli" && message.Channel != "tui" && message.Channel != "web" {
 			return nil
 		}
 		return err
@@ -514,7 +514,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		return fmt.Errorf("validate source message identity: %w", err)
 	}
 	if duplicate {
-		if message.Channel != "cli" && message.Channel != "tui" {
+		if message.Channel != "cli" && message.Channel != "tui" && message.Channel != "web" {
 			return nil
 		}
 		return ErrDuplicateMessage

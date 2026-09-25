@@ -15,10 +15,13 @@ var conversationName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$`)
 var requestIdentity = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 
 // ValidateLocalMessage owns the untrusted local operator boundary. Remote
-// channel intake has its own transport authorization and identity rules.
+// channel intake has its own transport authorization and identity rules. The
+// web channel is the browser front desk's shim-mediated local intake (phase 4,
+// B2): it is a local channel that reaches the same dispatcher as cli/tui
+// through the token-guarded jobunthree service, never a remote transport.
 func ValidateLocalMessage(message core.Message) error {
-	if message.Channel != "cli" && message.Channel != "tui" {
-		return errors.New("local messages require channel cli or tui")
+	if message.Channel != "cli" && message.Channel != "tui" && message.Channel != "web" {
+		return errors.New("local messages require channel cli, tui or web")
 	}
 	if err := ValidateConversationName(message.Conversation); err != nil {
 		return err
