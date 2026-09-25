@@ -14,4 +14,9 @@
 
 ## Child DOX Index
 
-No child DOX files.
+Direct child DOX files:
+
+| Child | Scope |
+| --- | --- |
+| [tracking/AGENTS.md](tracking/AGENTS.md) | Fork-drift alarm pin tracking state for external branches. |
+
