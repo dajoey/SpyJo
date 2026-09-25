@@ -119,6 +119,7 @@ func (s *Server) taskControl(response http.ResponseWriter, request *http.Request
 	result, err := s.Service.TaskControl(request.Context(), app.TaskControlRequest{
 		TaskID: input.TaskID, Action: input.Action, Text: input.Text,
 		ControlID: input.ControlID, Addressee: input.Addressee, Tail: input.Tail,
+		Staff: input.Staff, WakeAt: input.WakeAt,
 	})
 	if err != nil {
 		var coded interface{ Code() string }
@@ -129,7 +130,7 @@ func (s *Server) taskControl(response http.ResponseWriter, request *http.Request
 				status = http.StatusBadRequest
 			case "not_found":
 				status = http.StatusNotFound
-			case "not_steerable", "not_active", "already_delivered", "unsupported":
+			case "not_steerable", "not_active", "already_delivered", "unsupported", "review_in_progress":
 				status = http.StatusConflict
 			}
 			writeJSON(response, status, map[string]string{"error": err.Error(), "code": coded.Code()})
@@ -148,6 +149,8 @@ type taskControlRequest struct {
 	ControlID string `json:"control_id,omitempty"`
 	Addressee string `json:"addressee,omitempty"`
 	Tail      int    `json:"tail,omitempty"`
+	Staff     string `json:"staff,omitempty"`
+	WakeAt    string `json:"wake_at,omitempty"`
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {

@@ -174,3 +174,43 @@ func TestTaskControlRouteResolvesAClaimedTask(t *testing.T) {
 		t.Fatalf("payload = %#v", payload)
 	}
 }
+
+func TestTaskControlRouteDecodesStaffAndWakeAtFields(t *testing.T) {
+	server, token, ts := newTaskControlServer(t)
+	service := server.Service
+
+	taskID := "tasks-20260925-control-route-reassign"
+	path := filepath.Join(service.Config.StatePath("tasks", "waiting"), taskID+".md")
+	document := orchestrator.Document{FrontMatter: map[string]any{
+		"id": taskID, "title": "Waiting fixture", "status": "waiting", "review_required": false, "attempt": 1,
+		"wake_at": "2026-09-25T12:00:00Z",
+	}, Body: "# Task\n\n## Progress\n"}
+	if err := orchestrator.WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test reassign with staff field
+	req, _ := http.NewRequest("POST", ts.URL+"/v1/task-control", strings.NewReader(`{"task_id":"`+taskID+`","action":"reassign","staff":"pi"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reassign status = %d", resp.StatusCode)
+	}
+
+	// Test snooze with wake_at field
+	future := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	req2, _ := http.NewRequest("POST", ts.URL+"/v1/task-control", strings.NewReader(`{"task_id":"`+taskID+`","action":"snooze","wake_at":"`+future+`"}`))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("snooze status = %d", resp2.StatusCode)
+	}
+}
