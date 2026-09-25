@@ -1071,7 +1071,10 @@ func (s *Service) finishCancelledJobAfterGrace(job Job) {
 		for {
 			time.Sleep(200 * time.Millisecond)
 			current, ok := s.Runtime.Job(job.ID)
-			if !ok || current.StableID != job.StableID || current.Execution != JobCancelling {
+			if !ok || current.StableID != job.StableID {
+				return
+			}
+			if executionStateIsLive(current.Execution) && current.Execution != JobCancelling {
 				return
 			}
 			if !s.Harness.IsActive(job.SessionKey) || time.Now().After(deadline) {

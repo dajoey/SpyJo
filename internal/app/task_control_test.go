@@ -28,6 +28,14 @@ type taskControlHarness struct {
 	liveRequests      []harness.ControlRequest
 	liveErr           error
 	cancelledControls []string
+	interruptFn       func(ctx context.Context, key string) (bool, error)
+}
+
+func (h *taskControlHarness) Interrupt(ctx context.Context, key string) (bool, error) {
+	if h.interruptFn != nil {
+		return h.interruptFn(ctx, key)
+	}
+	return h.heldServiceHarness.Interrupt(ctx, key)
 }
 
 func (h *taskControlHarness) SendControl(_ context.Context, _ string, request harness.ControlRequest) (harness.ControlResult, error) {
@@ -417,3 +425,118 @@ func TestTaskControlValidatesPayloadBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestTaskControlStopFamilyAcksAsynchronouslyWhileInterruptBlocks(t *testing.T) {
+	for _, action := range []string{"stop", "stop-done", "stop-cancel"} {
+		t.Run(action, func(t *testing.T) {
+			service, target := newTaskControlService(t)
+			taskID := "tasks-20260925-async-stop-" + action
+			path, lease := claimTaskForControl(t, service, taskID, 1, nil)
+			target.active[lease.SessionKey] = true
+
+			interruptStarted := make(chan struct{})
+			releaseInterrupt := make(chan struct{})
+			defer close(releaseInterrupt)
+
+			target.interruptFn = func(ctx context.Context, key string) (bool, error) {
+				close(interruptStarted)
+				select {
+				case <-releaseInterrupt:
+					return true, nil
+				case <-ctx.Done():
+					return false, ctx.Err()
+				}
+			}
+
+			type callResult struct {
+				res TaskControlResult
+				err error
+			}
+			done := make(chan callResult, 1)
+			go func() {
+				res, err := service.TaskControl(context.Background(), TaskControlRequest{TaskID: taskID, Action: action})
+				done <- callResult{res: res, err: err}
+			}()
+
+			select {
+			case r := <-done:
+				if r.err != nil {
+					t.Fatalf("%s control failed: %v", action, r.err)
+				}
+				if !r.res.Stopped {
+					t.Fatalf("%s result = %#v", action, r.res)
+				}
+				switch action {
+				case "stop":
+					if r.res.State != "stopping" {
+						t.Fatalf("expected state 'stopping', got %q", r.res.State)
+					}
+					if _, err := os.Stat(path); err != nil {
+						t.Fatalf("document left working/: %v", err)
+					}
+				case "stop-done":
+					if r.res.State != "done" || r.res.Settled != "done" {
+						t.Fatalf("expected state 'done' and settled 'done', got %#v", r.res)
+					}
+					settled := filepath.Join(filepath.Dir(filepath.Dir(path)), "done", filepath.Base(path))
+					if _, err := os.Stat(settled); err != nil {
+						t.Fatalf("document did not settle into done/: %v", err)
+					}
+				case "stop-cancel":
+					if r.res.State != "cancelled" || r.res.Settled != "cancelled" {
+						t.Fatalf("expected state 'cancelled' and settled 'cancelled', got %#v", r.res)
+					}
+					settled := filepath.Join(filepath.Dir(filepath.Dir(path)), "cancelled", filepath.Base(path))
+					if _, err := os.Stat(settled); err != nil {
+						t.Fatalf("document did not settle into cancelled/: %v", err)
+					}
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("action %q did not ack within 2s while Interrupt was blocking", action)
+			}
+		})
+	}
+}
+
+func TestTaskControlStopJobEndsWithinGraceWhenTurnNeverResolves(t *testing.T) {
+	service, target := newTaskControlService(t)
+	service.jobCancellationGrace = 50 * time.Millisecond
+	taskID := "tasks-20260925-never-resolves-stop"
+	_, lease := claimTaskForControl(t, service, taskID, 1, nil)
+	jobID := service.Runtime.Jobs()[0].ID
+	target.active[lease.SessionKey] = true
+
+	// Turn never resolves: Interrupt returns true, but IsActive remains true
+	target.interruptFn = func(ctx context.Context, key string) (bool, error) {
+		return true, nil
+	}
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{TaskID: taskID, Action: "stop"})
+	if err != nil {
+		t.Fatalf("stop control failed: %v", err)
+	}
+	if !result.Stopped {
+		t.Fatalf("stop result = %#v", result)
+	}
+
+	// Also simulate an intermediate lease update to awaiting_transition
+	// (this must not prevent the cancelling job from reaching EndJob)
+	service.Runtime.UpdateJobFromLease(jobID, "awaiting_transition", "task_implementation", "", time.Now().UTC(), 0)
+
+	// Poll Runtime for EndJob within grace (50ms) + 1 poll interval (200ms) + small buffer
+	deadline := time.Now().Add(500 * time.Millisecond)
+	ended := false
+	for time.Now().Before(deadline) {
+		if _, ok := service.Runtime.Job(jobID); !ok {
+			ended = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !ended {
+		job, _ := service.Runtime.Job(jobID)
+		t.Fatalf("job %d remained alive past grace (execution: %s)", jobID, job.Execution)
+	}
+}
+

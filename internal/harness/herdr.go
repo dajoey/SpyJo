@@ -1457,7 +1457,7 @@ func (h *Herdr) teardownWorker(key, tabID, paneID, agentName string, force bool)
 		return
 	}
 	defer lock.Unlock()
-	if h.IsActive(key) {
+	if !force && h.IsActive(key) {
 		return
 	}
 

@@ -657,7 +657,7 @@ func (r *Runtime) UpdateJobFromLease(id int, state, phase, detail string, heartb
 	}
 	resumeFromTransition := job.Execution == JobAwaitingTransition &&
 		(execution == JobRunning || execution == JobRecovering) && !staleExecution
-	if executionStateIsTerminal(job.Execution) && !executionStateIsTerminal(execution) && !resumeFromTransition {
+	if job.Execution == JobCancelling || executionStateIsTerminal(job.Execution) && !executionStateIsTerminal(execution) && !resumeFromTransition {
 		execution = job.Execution
 	}
 	cleanState := boundPlainJobText(state, maxJobStatusDetail)

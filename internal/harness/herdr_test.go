@@ -438,3 +438,79 @@ esac
 		t.Fatal("tab was not closed after interrupt: worker pane left open")
 	}
 }
+
+func TestTeardownWorkerForceClosesTabEvenWhenTurnIsActive(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "herdr-mock.sh")
+	eventsFile := filepath.Join(dir, "events.txt")
+
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+cmd="$1"
+sub="$2"
+case "$cmd" in
+tab)
+	case "$sub" in
+	close)
+		echo "tab-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+pane)
+	case "$sub" in
+	close)
+		echo "pane-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+agent)
+	case "$sub" in
+	rename)
+		echo "agent-cleared" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+esac
+`, eventsFile, eventsFile, eventsFile)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHerdr(HarnessConfig{
+		Name:         "herdr",
+		Command:      scriptPath,
+		Cwd:          dir,
+		SessionsFile: filepath.Join(dir, "sessions.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := "orchestrator:tasks:task_implementation:test-task:1"
+	// Simulate a turn that is active
+	h.mu.Lock()
+	h.active[key] = &herdrTurn{target: "sj-worker-1"}
+	h.mu.Unlock()
+
+	if !h.IsActive(key) {
+		t.Fatal("expected turn to be active")
+	}
+
+	// Non-forced teardown should bail because turn is active
+	h.teardownWorker(key, "tab-normal", "", "sj-worker-1", false)
+	data, _ := os.ReadFile(eventsFile)
+	if strings.Contains(string(data), "tab-closed") {
+		t.Fatal("non-forced teardown closed tab while turn was active")
+	}
+
+	// Forced teardown MUST close the tab even when turn is active
+	h.teardownWorker(key, "tab-force", "", "sj-worker-1", true)
+	data, _ = os.ReadFile(eventsFile)
+	if !strings.Contains(string(data), "tab-closed") {
+		t.Fatal("forced teardown failed to close tab while turn was active")
+	}
+}
+
