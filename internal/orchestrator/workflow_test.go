@@ -1041,7 +1041,6 @@ func TestStrandedTaskGetsOneRecoveryThenRequeuesAsAttempt(t *testing.T) {
 	}
 }
 
-
 // A turn that is still running owns its lease no matter how long it has been quiet:
 // an in-flight dispatch or a live harness session is never re-dispatched underneath.
 func TestLiveSessionKeepsItsAwaitingTransitionLease(t *testing.T) {
@@ -1509,7 +1508,10 @@ func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
 		editFrontMatter(t, task, func(fm map[string]any) {
 			fm["agent"] = "kimi"
 		})
-		fake.sendErrs = []error{errors.New("429 rate limit exceeded; resets at 2026-09-25T05:30:00Z")}
+		// The reset time must stay in the future: parseQuotaResetTime rejects
+		// past timestamps, so a hardcoded one turns this test into a time bomb.
+		resetStamp := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Minute).Format(time.RFC3339)
+		fake.sendErrs = []error{errors.New("429 rate limit exceeded; resets at " + resetStamp)}
 
 		scanAndWait(t, manager)
 
@@ -1521,11 +1523,11 @@ func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
 		if doc.FrontMatter["status"] != "waiting" {
 			t.Fatalf("status = %v, want waiting", doc.FrontMatter["status"])
 		}
-		if doc.FrontMatter["quota_reset_at"] != "2026-09-25T05:30:00Z" {
-			t.Fatalf("quota_reset_at = %v, want 2026-09-25T05:30:00Z", doc.FrontMatter["quota_reset_at"])
+		if doc.FrontMatter["quota_reset_at"] != resetStamp {
+			t.Fatalf("quota_reset_at = %v, want %s", doc.FrontMatter["quota_reset_at"], resetStamp)
 		}
-		if doc.FrontMatter["wake_at"] != "2026-09-25T05:30:00Z" {
-			t.Fatalf("wake_at = %v, want 2026-09-25T05:30:00Z", doc.FrontMatter["wake_at"])
+		if doc.FrontMatter["wake_at"] != resetStamp {
+			t.Fatalf("wake_at = %v, want %s", doc.FrontMatter["wake_at"], resetStamp)
 		}
 		if doc.FrontMatter["agent"] != "kimi" {
 			t.Fatalf("agent changed to %v, want kimi", doc.FrontMatter["agent"])
@@ -1533,7 +1535,7 @@ func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
 		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
 			t.Fatalf("resume_credit was not set: %#v", doc.FrontMatter)
 		}
-		if !strings.Contains(doc.Body, "quota wall on kimi; parked until 2026-09-25T05:30:00Z; attempt not spent") {
+		if !strings.Contains(doc.Body, "quota wall on kimi; parked until "+resetStamp+"; attempt not spent") {
 			t.Fatalf("progress note missing: %s", doc.Body)
 		}
 
@@ -1633,4 +1635,3 @@ func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
 		}
 	}
 }
-

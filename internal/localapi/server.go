@@ -81,14 +81,9 @@ type liveTUIRequest struct {
 	Conversation string `json:"conversation"`
 }
 
-func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
-	if s.Service == nil || s.Token == "" {
-		return errors.New("local API requires a service and token")
-	}
-	// The owner may have spent an unbounded interval starting its harness and
-	// channels after election. Anchor the cleanup fence to the point when live
-	// TUI clients can actually renew, before accepting any request.
-	s.Service.FenceCleanupForLiveTUIReadmission()
+// routes builds the authenticated loopback route table. It is a method so
+// tests exercise exactly what Serve installs.
+func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.authorize(s.health))
 	mux.HandleFunc("GET /v1/state", s.authorize(s.state))
@@ -106,6 +101,64 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	mux.HandleFunc("POST /v1/diagnostic", s.authorize(s.diagnostic))
 	mux.HandleFunc("POST /v1/tui-live", s.authorize(s.liveTUI))
 	mux.HandleFunc("DELETE /v1/tui-live", s.authorize(s.liveTUI))
+	// Task-id-addressed control for the conversations surface: message
+	// (queued), interrupt, cancel-queued, output, stop, stop-done, stop-cancel.
+	mux.HandleFunc("POST /v1/task-control", s.authorize(s.taskControl))
+	return mux
+}
+
+// taskControl is the loopback bearer-guarded control route. Errors keep the
+// coded JSON shape so a caller can distinguish bad payloads (400) from
+// unresolvable task ids (404) and unsteerable runs (409).
+func (s *Server) taskControl(response http.ResponseWriter, request *http.Request) {
+	var input taskControlRequest
+	if err := decodeJSON(request.Body, &input); err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return
+	}
+	result, err := s.Service.TaskControl(request.Context(), app.TaskControlRequest{
+		TaskID: input.TaskID, Action: input.Action, Text: input.Text,
+		ControlID: input.ControlID, Addressee: input.Addressee, Tail: input.Tail,
+	})
+	if err != nil {
+		var coded interface{ Code() string }
+		if errors.As(err, &coded) {
+			status := http.StatusInternalServerError
+			switch coded.Code() {
+			case "bad_request":
+				status = http.StatusBadRequest
+			case "not_found":
+				status = http.StatusNotFound
+			case "not_steerable", "not_active", "already_delivered", "unsupported":
+				status = http.StatusConflict
+			}
+			writeJSON(response, status, map[string]string{"error": err.Error(), "code": coded.Code()})
+			return
+		}
+		writeError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, result)
+}
+
+type taskControlRequest struct {
+	TaskID    string `json:"task_id"`
+	Action    string `json:"action"`
+	Text      string `json:"text,omitempty"`
+	ControlID string `json:"control_id,omitempty"`
+	Addressee string `json:"addressee,omitempty"`
+	Tail      int    `json:"tail,omitempty"`
+}
+
+func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
+	if s.Service == nil || s.Token == "" {
+		return errors.New("local API requires a service and token")
+	}
+	// The owner may have spent an unbounded interval starting its harness and
+	// channels after election. Anchor the cleanup fence to the point when live
+	// TUI clients can actually renew, before accepting any request.
+	s.Service.FenceCleanupForLiveTUIReadmission()
+	mux := s.routes()
 	serverContext, cancelServer := context.WithCancel(ctx)
 	defer cancelServer()
 	server := &http.Server{

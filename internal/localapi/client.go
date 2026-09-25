@@ -347,6 +347,30 @@ func (c *Client) RunOnce(ctx context.Context) error {
 	return responseError(response)
 }
 
+// TaskControl executes one task-id-addressed control action on the workspace
+// server: message (queued), interrupt, cancel-queued, output, stop, stop-done,
+// or stop-cancel. Coded failures arrive as *app-wrapped errors the caller can
+// classify through their Code() method.
+func (c *Client) TaskControl(ctx context.Context, request app.TaskControlRequest) (app.TaskControlResult, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return app.TaskControlResult{}, err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/task-control", body)
+	if err != nil {
+		return app.TaskControlResult{}, err
+	}
+	defer response.Body.Close()
+	if err := responseError(response); err != nil {
+		return app.TaskControlResult{}, err
+	}
+	var result app.TaskControlResult
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return app.TaskControlResult{}, err
+	}
+	return result, nil
+}
+
 func (c *Client) request(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
 	if c.socketPath != "" {
 		descriptor, err := readSocketDescriptor(c.socketPath)

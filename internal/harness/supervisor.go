@@ -487,6 +487,77 @@ func followUpMode(target Harness) FollowUpMode {
 	return FollowUpSteer
 }
 
+// SendLiveControl delivers a control prompt into the active execution now.
+// Steer-capable harnesses take their existing native steer path through
+// SendControl; queue-mode harnesses that expose a live prompt (pane-backed
+// workers) bypass the queue entirely. It never queues: a harness with neither
+// capability reports an error instead of deferring delivery.
+func (s *Supervisor) SendLiveControl(ctx context.Context, key string, request ControlRequest) (ControlResult, error) {
+	if request.ID == "" || strings.TrimSpace(request.Prompt) == "" {
+		return ControlResult{}, errors.New("invalid empty control request")
+	}
+	s.mu.Lock()
+	target, err := s.targetLocked()
+	if err != nil {
+		s.mu.Unlock()
+		return ControlResult{}, err
+	}
+	mode := followUpMode(target)
+	s.mu.Unlock()
+	if mode == FollowUpSteer {
+		return s.SendControl(ctx, key, request)
+	}
+	s.mu.Lock()
+	if s.active[key] == 0 || !target.IsActive(key) {
+		s.mu.Unlock()
+		return ControlResult{}, errors.New("job provider turn is no longer active or steerable")
+	}
+	generation := s.controlGeneration[key]
+	s.mu.Unlock()
+	if request.Validate != nil && !request.Validate() {
+		return ControlResult{}, errors.New("job ownership or durable state changed before live delivery")
+	}
+	s.mu.RLock()
+	validDelivery := !s.closed && s.active[key] > 0 && s.controlGeneration[key] == generation
+	s.mu.RUnlock()
+	if !validDelivery {
+		return ControlResult{}, errors.New("job was cancelled or completed before live delivery")
+	}
+	prompter, ok := target.(LivePrompter)
+	if !ok {
+		return ControlResult{}, errors.New("active harness declares no live delivery path for mid-run steering")
+	}
+	if err := prompter.PromptLive(ctx, key, request.Prompt); err != nil {
+		return ControlResult{}, err
+	}
+	return ControlResult{}, nil
+}
+
+// CancelQueuedControl withdraws a queued control message before its turn-end
+// delivery. It reports false when no matching queued control remains (already
+// delivered, already cancelled, or never queued); no provider or job events
+// are synthesized because the execution itself is untouched.
+func (s *Supervisor) CancelQueuedControl(key, id string) bool {
+	if id == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	queue := s.pending[key]
+	for index, pending := range queue {
+		if pending.control == nil || pending.control.id != id {
+			continue
+		}
+		rest := append([]pendingSend(nil), queue[index+1:]...)
+		s.pending[key] = append(queue[:index:index], rest...)
+		if seen := s.seenControl[key]; seen != nil {
+			delete(seen, id)
+		}
+		return true
+	}
+	return false
+}
+
 func sendWithInference(target Harness, ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if dispatcher, ok := target.(InferenceDispatcher); ok {
 		return dispatcher.SendWithInference(ctx, key, prompt, selection, emit)

@@ -1191,6 +1191,32 @@ func (h *Herdr) Interrupt(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+// PromptLive submits a prompt into the live worker pane of an active turn
+// without waiting for completion. It is the interrupt primitive for
+// pane-backed workers: the text reaches the running agent session immediately;
+// whether the runner steers the active turn or buffers it in its input is the
+// runner's native behavior. Rejections (for example a blocked agent) surface
+// as ordinary errors so callers can fall back to queued delivery.
+func (h *Herdr) PromptLive(ctx context.Context, key, prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return errors.New("live prompt is empty")
+	}
+	h.mu.Lock()
+	turn := h.active[key]
+	h.mu.Unlock()
+	if turn == nil {
+		return errors.New("herdr turn is no longer active")
+	}
+	promptCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(promptCtx, h.config.Command, "agent", "prompt", turn.target, prompt)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("herdr live prompt to %s: %w (%s)", turn.target, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
 func (h *Herdr) ResetSession(key string) error {
 	lock := h.lockForKey(key)
 	lock.Lock()

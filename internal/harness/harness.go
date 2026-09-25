@@ -186,6 +186,29 @@ type ControlSender interface {
 	SendControl(context.Context, string, ControlRequest) (ControlResult, error)
 }
 
+// LivePrompter submits a prompt into the live session of an already-active
+// turn without waiting for turn completion. It is implemented by pane-backed
+// adapters (herdr) whose interactive agents accept input mid-run; whether the
+// runner steers the active turn or buffers the text in its input is the
+// runner's native behavior.
+type LivePrompter interface {
+	PromptLive(ctx context.Context, key, prompt string) error
+}
+
+// LiveControlSender is implemented by the provider-neutral supervisor: it
+// delivers a control prompt into the active execution now instead of queueing
+// it for turn end. Steer-capable harnesses take their native steer path;
+// pane-backed harnesses take PromptLive.
+type LiveControlSender interface {
+	SendLiveControl(ctx context.Context, key string, request ControlRequest) (ControlResult, error)
+}
+
+// QueuedControlCanceller is implemented by the provider-neutral supervisor: it
+// withdraws a queued control message before its turn-end delivery.
+type QueuedControlCanceller interface {
+	CancelQueuedControl(key, id string) bool
+}
+
 // ConversationSender preserves the exact user message separately from the
 // rendered harness prompt. Supervisors use it to collapse several queued chat
 // follow-ups into one provider turn without concatenating repeated framework

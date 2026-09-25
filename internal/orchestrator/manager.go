@@ -1338,6 +1338,46 @@ func (m *Manager) completeTransition(ctx context.Context, route workflowRoute, l
 	return nil
 }
 
+// SettleTaskByOperator records an operator-initiated terminal settle of a
+// claimed task document and moves it to the terminal folder. It is the
+// control-path twin of the honored operator review-cancel: the note must
+// document the operator authority, and a done settle's summary map must carry
+// the checker-accepted direct-completion shape (verdict, outcome, evidence,
+// uncertainty, completed_at) with completed_at equal to the updated_at this
+// move stamps. The caller remains responsible for stopping the run; the
+// ordinary reconcile then validates the transition and runs terminal hooks
+// and the notification decision.
+func (m *Manager) SettleTaskByOperator(lease Lease, status string, note string, summary map[string]any, extra func(map[string]any)) (string, error) {
+	switch status {
+	case "done", "cancelled", "failed":
+	default:
+		return "", fmt.Errorf("unsupported operator settle status %q", status)
+	}
+	if _, err := os.Stat(lease.File); err != nil {
+		return "", fmt.Errorf("claimed document is unavailable: %w", err)
+	}
+	route, ok := routeByName(lease.Route)
+	if !ok {
+		return "", fmt.Errorf("unknown route %q", lease.Route)
+	}
+	base := filepath.Dir(m.Config.Resolve(route.Source))
+	target := statusPath(base, status, filepath.Base(lease.File))
+	now := time.Now().UTC()
+	update := func(frontMatter map[string]any) {
+		if summary != nil {
+			frontMatter["completion_summary"] = summary
+		}
+		if extra != nil {
+			extra(frontMatter)
+		}
+	}
+	if err := moveDocumentWithUpdate(lease.File, target, status, now, note, update); err != nil {
+		return "", err
+	}
+	m.requestScan()
+	return target, nil
+}
+
 func requiresTaskNotificationDecision(document Document, status string, now time.Time) bool {
 	switch status {
 	case "done", "failed", "cancelled":
@@ -2556,7 +2596,7 @@ func resolveRunnerName(document Document, lease Lease) string {
 }
 
 var (
-	rfc3339Regex    = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
+	rfc3339Regex     = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
 	relativeSecRegex = regexp.MustCompile(`resets? in (\d+)\s*(?:s|sec|seconds?)`)
 	runnerPlanMap    = map[string]string{
 		"opencode": "opencode_go",
