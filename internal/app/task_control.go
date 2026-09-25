@@ -240,9 +240,12 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			}
 		}
 
-		summaryStr := fmt.Sprintf("\n    completed_at: %q\n    evidence: \"Operator review verdict (Approve) on the Helm web conversation at %s; settled done by operator authority.\"\n    outcome: \"Operator approved this task from the Helm web conversation.\"\n    uncertainty: \"Approved by operator decision; accepted without independent reviewer rework.\"\n    verdict: completed", stamp, stamp)
+		summaryStr := fmt.Sprintf("completion_summary:\n    completed_at: %q\n    evidence: %q\n    outcome: %q\n    uncertainty: %q\n    verdict: completed", stamp,
+			fmt.Sprintf("Operator review verdict (Approve) on the Helm web conversation at %s; settled done by operator authority.", stamp),
+			"Operator approved this task from the Helm web conversation.",
+			"Approved by operator decision; accepted without independent reviewer rework.")
 
-		content, err = SurgicallyUpdateFrontMatterField(content, "completion_summary", summaryStr)
+		content, err = SurgicallyReplaceFrontMatterField(content, "completion_summary", summaryStr)
 		if err != nil {
 			return TaskControlResult{}, err
 		}
@@ -257,6 +260,11 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			return TaskControlResult{}, err
 		}
 		_ = os.Remove(taskPath)
+		// The settle machinery a claimed transition gets through reconcile:
+		// code-managed summary stamp, task.completed hooks, notification turn.
+		if s.Orchestrator != nil {
+			s.Orchestrator.FinalizeOperatorTaskTransition(ctx, targetPath, taskID, operatorThreadID(doc), "done")
+		}
 
 		return TaskControlResult{
 			OK:      true,
@@ -304,19 +312,15 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			return TaskControlResult{}, err
 		}
 
-		rework := 0
-		if val, ok := doc.FrontMatter["rework_count"]; ok {
-			switch v := val.(type) {
-			case int:
-				rework = v
-			case int64:
-				rework = int(v)
-			case float64:
-				rework = int(v)
-			}
-		}
-		rework++
-		content, err = SurgicallyUpdateFrontMatterField(content, "rework_count", strconv.Itoa(rework))
+		// Joey's own review verdict: a rejected completion_summary with
+		// reviewed_at, exactly as an independent reviewer records one. The
+		// code-managed rework_count is derived from review_attempt by the
+		// framework's finalize stamp — never hand-written here.
+		rejectedStr := fmt.Sprintf("completion_summary:\n    evidence: %q\n    outcome: %q\n    reviewed_at: %q\n    verdict: rejected",
+			fmt.Sprintf("Operator review verdict (Request changes) on the Helm web conversation at %s; the revision instruction quoted in ## Progress is the authority.", stamp),
+			"Operator requested changes from the Helm web conversation; task returned to todo/ as a revision of the same task id.",
+			stamp)
+		content, err = SurgicallyReplaceFrontMatterField(content, "completion_summary", rejectedStr)
 		if err != nil {
 			return TaskControlResult{}, err
 		}
@@ -328,13 +332,18 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			return TaskControlResult{}, err
 		}
 		_ = os.Remove(taskPath)
+		// Stamp the code-managed summary and rescan the queue so the revision
+		// dispatches promptly. todo is not a terminal outcome: no hooks, no
+		// notification decision.
+		if s.Orchestrator != nil {
+			s.Orchestrator.FinalizeOperatorTaskTransition(ctx, targetPath, taskID, operatorThreadID(doc), "todo")
+		}
 
 		return TaskControlResult{
-			OK:      true,
-			Action:  action,
-			TaskID:  taskID,
-			State:   "todo",
-			Settled: "todo",
+			OK:     true,
+			Action: action,
+			TaskID: taskID,
+			State:  "todo",
 		}, nil
 
 	case "reassign":
@@ -439,7 +448,7 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 		}, nil
 
 	case "wake-now":
-		taskPath, folder, _, err := s.findTaskDocument(taskID)
+		taskPath, folder, doc, err := s.findTaskDocument(taskID)
 		if err != nil {
 			return TaskControlResult{}, err
 		}
@@ -470,6 +479,7 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			return TaskControlResult{}, err
 		}
 		content, _ = SurgicallyDeleteFrontMatterField(content, "wake_at")
+		content, _ = SurgicallyDeleteFrontMatterField(content, "waiting_for")
 
 		progressNote := "Operator control (Helm web conversation): Woke now; returned to todo/ for fresh dispatch."
 		content = SurgicallyAppendProgress(content, progressNote, now)
@@ -478,13 +488,16 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 			return TaskControlResult{}, err
 		}
 		_ = os.Remove(taskPath)
+		// Rescan so the woken task dispatches promptly.
+		if s.Orchestrator != nil {
+			s.Orchestrator.FinalizeOperatorTaskTransition(ctx, targetPath, taskID, operatorThreadID(doc), "todo")
+		}
 
 		return TaskControlResult{
-			OK:      true,
-			Action:  action,
-			TaskID:  taskID,
-			State:   "todo",
-			Settled: "todo",
+			OK:     true,
+			Action: action,
+			TaskID: taskID,
+			State:  "todo",
 		}, nil
 	}
 
@@ -625,6 +638,13 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 	}
 }
 
+// operatorThreadID returns the Helm thread id recorded on a task document,
+// if any, for hook and notification metadata on unclaimed operator settles.
+func operatorThreadID(doc orchestrator.Document) string {
+	id, _ := doc.FrontMatter["helm_thread_id"].(string)
+	return id
+}
+
 // deliverJobControlLive delivers the operator-message envelope into the live
 // session now instead of queueing it for turn end.
 func (s *Service) deliverJobControlLive(ctx context.Context, job Job, lease orchestrator.Lease, documentID, text string) (harness.ControlResult, error) {
@@ -688,4 +708,3 @@ func (s *Service) stopResolvedTaskJob(job Job) error {
 	}()
 	return nil
 }
-

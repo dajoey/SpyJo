@@ -663,7 +663,7 @@ func TestTaskControlRequestChangesReturnsSameTaskIDToTodoWithRework(t *testing.T
 	taskID := "tasks-20260925-request-changes-demo"
 	reviewPath := stageTaskInFolder(t, service, taskID, "review", map[string]any{
 		"review_required": true,
-		"rework_count":    0,
+		"review_attempt":  1,
 	})
 
 	result, err := service.TaskControl(context.Background(), TaskControlRequest{
@@ -674,7 +674,7 @@ func TestTaskControlRequestChangesReturnsSameTaskIDToTodoWithRework(t *testing.T
 	if err != nil {
 		t.Fatalf("request-changes failed: %v", err)
 	}
-	if !result.OK || result.State != "todo" || result.Settled != "todo" {
+	if !result.OK || result.State != "todo" || result.Settled != "" {
 		t.Fatalf("request-changes result = %#v", result)
 	}
 
@@ -691,9 +691,18 @@ func TestTaskControlRequestChangesReturnsSameTaskIDToTodoWithRework(t *testing.T
 	if doc.FrontMatter["status"] != "todo" {
 		t.Errorf("status = %v, want todo", doc.FrontMatter["status"])
 	}
-	// rework_count must be incremented to 1
-	if rework, ok := doc.FrontMatter["rework_count"].(int); !ok || rework != 1 {
-		t.Errorf("rework_count = %v (type %T), want 1", doc.FrontMatter["rework_count"], doc.FrontMatter["rework_count"])
+	// The verdict is recorded as a rejected review summary; rework_count is
+	// code-managed (derived from review_attempt by the framework stamp),
+	// never hand-incremented by the route.
+	summary, ok := doc.FrontMatter["completion_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("rejected summary missing: %#v", doc.FrontMatter["completion_summary"])
+	}
+	if summary["verdict"] != "rejected" {
+		t.Errorf("summary verdict = %v, want rejected", summary["verdict"])
+	}
+	if rework, ok := summary["rework_count"].(int); !ok || rework != 1 {
+		t.Errorf("summary rework_count = %#v, want 1 (derived from review_attempt 1)", summary["rework_count"])
 	}
 	if !strings.Contains(doc.Body, "Requested changes at") || !strings.Contains(doc.Body, "Please fix the error handling in foo.go") {
 		t.Errorf("progress note missing revision instruction: %s", doc.Body)
@@ -802,7 +811,7 @@ func TestTaskControlWakeNowReturnsWaitingTaskToTodo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wake-now failed: %v", err)
 	}
-	if !result.OK || result.State != "todo" || result.Settled != "todo" {
+	if !result.OK || result.State != "todo" || result.Settled != "" {
 		t.Fatalf("wake-now result = %#v", result)
 	}
 
@@ -917,3 +926,123 @@ func TestTaskControlSnoozeAndWakeNowRejectNonWaitingTask(t *testing.T) {
 	}
 }
 
+
+// Rework finding 1 (2026-09-25 review): the mainline mixed-review flow — a
+// task whose reviewer rejected it (rejected completion_summary persisted by
+// Spynel in todo/), reworked, back in review/ — must web-Approve into a
+// readable done/ document with a single, valid operator summary.
+func TestTaskControlApproveReplacesPriorRejectedReviewSummary(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-approve-prior-rejected"
+	reviewPath := stageTaskInFolder(t, service, taskID, "review", map[string]any{
+		"review_required": true,
+		"review_attempt":  2,
+		"completion_summary": map[string]any{
+			"evidence":     "shipped but flawed, see findings",
+			"outcome":      "rejected for rework: composer collisions and corrupt settle",
+			"reviewed_at":  "2026-09-25T11:03:03Z",
+			"rework_count": 2,
+			"verdict":      "rejected",
+		},
+	})
+
+	if _, err := service.TaskControl(context.Background(), TaskControlRequest{TaskID: taskID, Action: "approve"}); err != nil {
+		t.Fatalf("approve failed: %v", err)
+	}
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Fatalf("file still in review/: %v", err)
+	}
+	donePath := filepath.Join(service.Config.StatePath("tasks", "done"), taskID+".md")
+	doc, err := orchestrator.ReadDocument(donePath)
+	if err != nil {
+		t.Fatalf("done document unreadable after approve on prior rejected summary: %v", err)
+	}
+	summary, ok := doc.FrontMatter["completion_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("completion_summary missing or not a map: %#v", doc.FrontMatter["completion_summary"])
+	}
+	if summary["verdict"] != "completed" {
+		t.Errorf("verdict = %v, want completed (old block must be gone)", summary["verdict"])
+	}
+	// rework_count is code-managed: derived from review_attempt (2) minus one
+	// for the done settle, not hand-written.
+	if rework, ok := summary["rework_count"].(int); !ok || rework != 1 {
+		t.Errorf("rework_count = %#v, want 1 (derived from review_attempt 2)", summary["rework_count"])
+	}
+}
+
+// Rework finding 2 + minor (2026-09-25 review): request-changes records a
+// rejected review summary (Joey's own verdict) with rework_count left to the
+// framework, and the response never claims todo as settled.
+func TestTaskControlRequestChangesRecordsRejectedSummaryWithCodeManagedRework(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-req-summary"
+	stageTaskInFolder(t, service, taskID, "review", map[string]any{
+		"review_required": true,
+		"review_attempt":  2,
+	})
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "request-changes",
+		Text:   "Re-shoot the phone screenshots",
+	})
+	if err != nil {
+		t.Fatalf("request-changes failed: %v", err)
+	}
+	if result.Settled != "" {
+		t.Errorf("result.Settled = %q, want empty (todo is not settled)", result.Settled)
+	}
+	todoPath := filepath.Join(service.Config.StatePath("tasks", "todo"), taskID+".md")
+	doc, err := orchestrator.ReadDocument(todoPath)
+	if err != nil {
+		t.Fatalf("todo document unreadable: %v", err)
+	}
+	summary, ok := doc.FrontMatter["completion_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("rejected review summary missing: %#v", doc.FrontMatter["completion_summary"])
+	}
+	if summary["verdict"] != "rejected" {
+		t.Errorf("verdict = %#v, want rejected", summary["verdict"])
+	}
+	if summary["reviewed_at"] == nil || summary["reviewed_at"] == "" {
+		t.Errorf("reviewed_at missing from rejected summary: %#v", summary)
+	}
+	if rework, ok := summary["rework_count"].(int); !ok || rework != 2 {
+		t.Errorf("summary rework_count = %#v, want 2 (derived from review_attempt, not hand-incremented)", summary["rework_count"])
+	}
+}
+
+// Minor finding (2026-09-25 review): wake-now strips waiting_for as the
+// recorded route contract says, and its response does not claim settled.
+func TestTaskControlWakeNowStripsWaitingForAndWakeAt(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-wakenow-strip"
+	stageTaskInFolder(t, service, taskID, "waiting", map[string]any{
+		"wake_at":     "2026-09-26T00:00:00Z",
+		"waiting_for": "'the nightly run to finish'",
+	})
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{TaskID: taskID, Action: "wake-now"})
+	if err != nil {
+		t.Fatalf("wake-now failed: %v", err)
+	}
+	if result.Settled != "" {
+		t.Errorf("result.Settled = %q, want empty", result.Settled)
+	}
+	todoPath := filepath.Join(service.Config.StatePath("tasks", "todo"), taskID+".md")
+	raw, err := os.ReadFile(todoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "waiting_for") || strings.Contains(string(raw), "wake_at") {
+		t.Errorf("waiting fields survived wake-now:\n%s", raw)
+	}
+	doc, err := orchestrator.ReadDocument(todoPath)
+	if err != nil {
+		t.Fatalf("todo document unreadable: %v", err)
+	}
+	if doc.FrontMatter["status"] != "todo" {
+		t.Errorf("status = %v, want todo", doc.FrontMatter["status"])
+	}
+}

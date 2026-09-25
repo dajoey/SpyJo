@@ -142,3 +142,113 @@ staff:
 		t.Errorf("inline comment lost")
 	}
 }
+
+// Rework finding 1 (2026-09-25 review): updating a field whose current value
+// is a multi-line block must consume the whole old block, not just the field
+// line. Approve on a task carrying a prior rejected completion_summary hit
+// exactly this and produced duplicate verdict/outcome keys.
+func TestSurgicalUpdateFrontMatterFieldReplacesWholeMultilineBlock(t *testing.T) {
+	content := `---
+attempt: 2
+completion_summary:
+    evidence: 'shipped but flawed'
+    outcome: 'first pass'
+    reviewed_at: "2026-09-25T10:00:00Z"
+    rework_count: 1
+    verdict: rejected
+id: tasks-demo
+status: review
+title: 'block replace demo'
+---
+
+# Body
+
+## Progress
+
+- entry one
+`
+	updated, err := SurgicallyUpdateFrontMatterField(content, "completion_summary", "verdict: completed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(updated, "rejected") {
+		t.Errorf("old block content survived the update:\n%s", updated)
+	}
+	if got := strings.Count(updated, "verdict:"); got != 1 {
+		t.Errorf("verdict key appears %d times, want 1:\n%s", got, updated)
+	}
+	if !strings.Contains(updated, "completion_summary: verdict: completed") {
+		t.Errorf("new scalar value missing:\n%s", updated)
+	}
+	// Every byte outside the replaced block is identical.
+	want := `---
+attempt: 2
+completion_summary: verdict: completed
+id: tasks-demo
+status: review
+title: 'block replace demo'
+---
+
+# Body
+
+## Progress
+
+- entry one
+`
+	if updated != want {
+		t.Errorf("byte fidelity failed:\n--- got ---\n%s\n--- want ---\n%s", updated, want)
+	}
+}
+
+func TestSurgicalReplaceFrontMatterFieldWritesMultilineBlock(t *testing.T) {
+	content := `---
+id: tasks-demo
+status: review
+---
+
+# Body
+`
+	replacement := "completion_summary:\n    completed_at: \"2026-09-25T12:00:00Z\"\n    verdict: completed"
+	updated, err := SurgicallyReplaceFrontMatterField(content, "completion_summary", replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(updated, "completion_summary:\n    completed_at: \"2026-09-25T12:00:00Z\"\n    verdict: completed\n---") {
+		t.Errorf("block not inserted before closing delimiter:\n%s", updated)
+	}
+	if !strings.Contains(updated, "id: tasks-demo\nstatus: review\n") {
+		t.Errorf("surrounding fields damaged:\n%s", updated)
+	}
+}
+
+func TestSurgicalDeleteFrontMatterFieldRemovesWholeMultilineBlock(t *testing.T) {
+	content := `---
+id: tasks-demo
+notify:
+    enabled: true
+    origin: tui/local
+status: waiting
+waiting_for: 'a person'
+---
+
+# Body
+`
+	updated, err := SurgicallyDeleteFrontMatterField(content, "notify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(updated, "enabled:") || strings.Contains(updated, "origin:") {
+		t.Errorf("block children survived delete:\n%s", updated)
+	}
+	want := `---
+id: tasks-demo
+status: waiting
+waiting_for: 'a person'
+---
+
+# Body
+`
+	if updated != want {
+		t.Errorf("byte fidelity failed:\n--- got ---\n%s\n--- want ---\n%s", updated, want)
+	}
+}
