@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1063,6 +1064,25 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 				return status, path, err
 			}
 		}
+		if status == "waiting" {
+			document, err := ReadDocument(path)
+			if err != nil {
+				return status, path, m.skipUnreadableDocument(path, err)
+			}
+			if !hasRoutableWaitingPath(document, time.Now().UTC()) {
+				note := "Park rejected: a park in waiting/ must carry a future RFC 3339 wake_at or a joey_ask in front matter; Spynel returned this task to todo without spending an attempt."
+				credit := func(frontMatter map[string]any) {
+					frontMatter[resumeCreditField] = true
+				}
+				now := time.Now().UTC()
+				target := statusPath(base, "todo", name)
+				if err := moveDocumentWithUpdate(path, target, "todo", now, note, credit); err != nil {
+					return "todo", path, err
+				}
+				m.log(note + " " + target)
+				return "todo", target, nil
+			}
+		}
 		if status == "review" {
 			document, err := ReadDocument(path)
 			if err != nil {
@@ -1128,6 +1148,25 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 			return status, path, err
 		}
 	}
+	if status == "waiting" {
+		document, err := ReadDocument(path)
+		if err != nil {
+			return status, path, m.skipUnreadableDocument(path, err)
+		}
+		if !hasRoutableWaitingPath(document, time.Now().UTC()) {
+			note := "Park rejected: a park in waiting/ must carry a future RFC 3339 wake_at or a joey_ask in front matter; Spynel returned this task to todo without spending an attempt."
+			credit := func(frontMatter map[string]any) {
+				frontMatter[resumeCreditField] = true
+			}
+			now := time.Now().UTC()
+			target := statusPath(base, "todo", name)
+			if err := moveDocumentWithUpdate(path, target, "todo", now, note, credit); err != nil {
+				return "todo", path, err
+			}
+			m.log(note + " " + target)
+			return "todo", target, nil
+		}
+	}
 	if status != "waiting" {
 		m.finalizeTaskCompletionSummary(path, status)
 	} else {
@@ -1163,7 +1202,23 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route workflowRoute
 				return m.redirectTransition(path, statusPath(base, "proposed", name), "proposed", "Goal activation rejected: "+err.Error())
 			}
 		}
-		if status == "waiting" || status == "abandoned" {
+		if status == "waiting" {
+			if !hasRoutableWaitingPath(document, time.Now().UTC()) {
+				note := "Park rejected: a park in waiting/ must carry a future RFC 3339 wake_at or a joey_ask in front matter; Spynel returned this goal to proposed."
+				credit := func(frontMatter map[string]any) {
+					frontMatter[resumeCreditField] = true
+				}
+				target := statusPath(base, "proposed", name)
+				now := time.Now().UTC()
+				if err := moveDocumentWithUpdate(path, target, "proposed", now, note, credit); err != nil {
+					return "proposed", path, err
+				}
+				m.log(note + " " + target)
+				return "proposed", target, nil
+			}
+			return status, path, nil
+		}
+		if status == "abandoned" {
 			return status, path, nil
 		}
 		return m.redirectTransition(path, statusPath(base, "proposed", name), "proposed", "Invalid goal-planning transition; planning must create a valid active round, wait on a precise condition, or record explicit abandonment.")
@@ -1175,10 +1230,58 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route workflowRoute
 		}
 		return status, path, nil
 	}
-	if status == "planning" || status == "waiting" || status == "abandoned" {
+	if status == "waiting" {
+		if !hasRoutableWaitingPath(document, time.Now().UTC()) {
+			note := "Park rejected: a park in waiting/ must carry a future RFC 3339 wake_at or a joey_ask in front matter; Spynel returned this goal to review."
+			credit := func(frontMatter map[string]any) {
+				frontMatter[resumeCreditField] = true
+			}
+			target := statusPath(base, "review", name)
+			now := time.Now().UTC()
+			if err := moveDocumentWithUpdate(path, target, "review", now, note, credit); err != nil {
+				return "review", path, err
+			}
+			m.log(note + " " + target)
+			return "review", target, nil
+		}
+		return status, path, nil
+	}
+	if status == "planning" || status == "abandoned" {
 		return status, path, nil
 	}
 	return m.redirectTransition(path, statusPath(base, "review", name), "review", "Invalid goal-review transition; review must choose planning, waiting, done, or abandoned.")
+}
+
+// hasRoutableWaitingPath checks whether a document entering waiting/ carries
+// an explicit routable path: either a non-empty joey_ask or a future RFC 3339 wake_at.
+func hasRoutableWaitingPath(document Document, now time.Time) bool {
+	if val, ok := document.FrontMatter["joey_ask"]; ok && val != nil {
+		switch v := val.(type) {
+		case string:
+			if strings.TrimSpace(v) != "" {
+				return true
+			}
+		case map[string]any:
+			if len(v) > 0 {
+				return true
+			}
+		case map[any]any:
+			if len(v) > 0 {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	wakeAtStr := stringField(document, "wake_at")
+	if wakeAtStr != "" {
+		if due, err := time.Parse(time.RFC3339, wakeAtStr); err == nil {
+			if due.After(now) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // grantParkCredit marks a task a turn just parked in waiting/, before the
@@ -1642,21 +1745,40 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 			continue
 		}
 		foreignOwner := lease.OwnerID != "" && lease.OwnerID != m.ownerID
+		if lease.State == "awaiting_transition" {
+			if (!foreignOwner && now.Sub(lease.HeartbeatAt) < awaitingTransitionStaleAfter) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
+				continue
+			}
+			if lease.RecoveryCount >= quickAwaitingTransitionRecoveries {
+				requeueStatus := "todo"
+				if route.Name == "goals" {
+					if normalizeLeasePhase(route.Name, lease.Phase) == phaseGoalReview {
+						requeueStatus = "review"
+					} else {
+						requeueStatus = "proposed"
+					}
+				}
+				base := filepath.Dir(m.Config.Resolve(route.Source))
+				target := filepath.Join(base, requeueStatus, filepath.Base(lease.File))
+				note := fmt.Sprintf("Spynel requeued this %s to %s because turn ended without moving the document after %d recovery attempt(s); attempt was spent.", strings.TrimSuffix(route.Name, "s"), requeueStatus, lease.RecoveryCount)
+				update := func(fm map[string]any) {
+					delete(fm, resumeCreditField)
+				}
+				if moveErr := moveDocumentWithUpdate(lease.File, target, requeueStatus, now.UTC(), note, update); moveErr != nil {
+					m.log("requeue stranded document: " + moveErr.Error())
+					continue
+				}
+				_ = os.Remove(m.leasePath(lease.ID))
+				m.finishRuntimeJob(lease.ID)
+				m.log(fmt.Sprintf("requeued stranded %s to %s: %s", route.Name, requeueStatus, target))
+				continue
+			}
+		}
 		staleThreshold := route.StaleAfter
 		switch {
 		case lease.State == "error":
 			staleThreshold = 10 * time.Second
-		case lease.State == "awaiting_transition" && lease.RecoveryCount < quickAwaitingTransitionRecoveries:
-			// awaiting_transition means the provider turn already ended and the
-			// only thing outstanding is the agent-authored durable file move.
-			// reconcileTransitions observes that move on the very next scan, and
-			// this loop is only reached while the document still sits at its
-			// claimed path -- so a lease lingering here has a finished turn that
-			// moved nothing. That is what an interrupted restart leaves behind:
-			// the recovery turn finds no surviving worker, returns in seconds,
-			// and the lease then waits out route.StaleAfter (30 minutes for
-			// tasks) while the external runner watchdog fails the task forward
-			// at 10, charging it an attempt it never got a fair run at.
+		case lease.State == "awaiting_transition":
 			staleThreshold = awaitingTransitionStaleAfter
 		}
 		if (!foreignOwner && now.Sub(lease.HeartbeatAt) < staleThreshold) || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
@@ -2171,7 +2293,8 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 // refusing work right now (backend overload, "please retry") rather than a
 // dead or misbehaving runner. Only the harness control-plane error text is
 // matched, never the provider event stream, and quota refusals (429 plan
-// limits) deliberately do not match: those must fail over to another seat.
+// limits) deliberately do not match: those wait for reset on the same runner
+// without spending an attempt.
 func transientProviderError(err error) bool {
 	if err == nil {
 		return false
@@ -2262,6 +2385,10 @@ func (m *Manager) recordRestartInterrupt(lease Lease, err error) {
 func (m *Manager) recordError(ctx context.Context, lease Lease, err error) {
 	if m.restartInterrupted(ctx, err) {
 		m.recordRestartInterrupt(lease, err)
+		return
+	}
+	if isQuotaError(err) {
+		m.recordQuotaError(lease, err)
 		return
 	}
 	lease.LastError = err.Error()
@@ -2399,4 +2526,153 @@ func (m *Manager) log(message string) {
 func leaseID(route, path string) string {
 	hash := sha256.Sum256([]byte(route + "\x00" + filepath.Clean(path)))
 	return hex.EncodeToString(hash[:12])
+}
+
+func isQuotaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate limit") ||
+		strings.Contains(msg, "rate_limit") ||
+		strings.Contains(msg, "quota limit") ||
+		strings.Contains(msg, "resource_exhausted") ||
+		strings.Contains(msg, "too many requests")
+}
+
+func resolveRunnerName(document Document, lease Lease) string {
+	if a := stringField(document, "agent"); a != "" {
+		return a
+	}
+	if r := stringField(document, "runner"); r != "" {
+		return r
+	}
+	return "default"
+}
+
+var (
+	rfc3339Regex    = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
+	relativeSecRegex = regexp.MustCompile(`resets? in (\d+)\s*(?:s|sec|seconds?)`)
+	runnerPlanMap    = map[string]string{
+		"opencode": "opencode_go",
+		"kimi":     "kimi_coding",
+		"agy":      "antigravity",
+		"pi":       "zai",
+	}
+)
+
+func parseQuotaResetTime(errMsg string, now time.Time) (time.Time, bool) {
+	if match := rfc3339Regex.FindString(errMsg); match != "" {
+		if t, err := time.Parse(time.RFC3339, match); err == nil && t.After(now) {
+			return t, true
+		}
+	}
+	if m := relativeSecRegex.FindStringSubmatch(strings.ToLower(errMsg)); len(m) == 2 {
+		if sec, err := strconv.Atoi(m[1]); err == nil && sec > 0 {
+			return now.Add(time.Duration(sec) * time.Second), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func readSnapshotResetTime(runner string, now time.Time) (time.Time, bool) {
+	if usageSnapshotPath == "" {
+		return time.Time{}, false
+	}
+	data, err := os.ReadFile(usageSnapshotPath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	var snap struct {
+		Plans map[string]map[string]any `json:"plans"`
+	}
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return time.Time{}, false
+	}
+	planKey := runnerPlanMap[runner]
+	if planKey == "" {
+		planKey = runner
+	}
+	planData, ok := snap.Plans[planKey]
+	if !ok || planData == nil {
+		return time.Time{}, false
+	}
+
+	var exhaustedReset time.Time
+	var anyFutureReset time.Time
+
+	for _, v := range planData {
+		windowMap, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		resetsAtRaw, _ := windowMap["resets_at"].(string)
+		if resetsAtRaw == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, resetsAtRaw)
+		if err != nil || !t.After(now) {
+			continue
+		}
+
+		pct := numberValue(windowMap["pct"])
+		if pct >= 100 {
+			if exhaustedReset.IsZero() || t.Before(exhaustedReset) {
+				exhaustedReset = t
+			}
+		}
+		if anyFutureReset.IsZero() || t.Before(anyFutureReset) {
+			anyFutureReset = t
+		}
+	}
+
+	if !exhaustedReset.IsZero() {
+		return exhaustedReset, true
+	}
+	if !anyFutureReset.IsZero() {
+		return anyFutureReset, true
+	}
+	return time.Time{}, false
+}
+
+func resolveQuotaResetTime(errMsg, runner string, now time.Time) time.Time {
+	if t, ok := parseQuotaResetTime(errMsg, now); ok {
+		return t
+	}
+	if t, ok := readSnapshotResetTime(runner, now); ok {
+		return t
+	}
+	return now.Add(1 * time.Hour)
+}
+
+func (m *Manager) recordQuotaError(lease Lease, err error) {
+	now := time.Now().UTC()
+	document, readErr := ReadDocument(lease.File)
+	runner := "default"
+	if readErr == nil {
+		runner = resolveRunnerName(document, lease)
+	}
+	resetTime := resolveQuotaResetTime(err.Error(), runner, now)
+	resetTimeStr := resetTime.UTC().Format(time.RFC3339)
+
+	route, ok := routeByName(lease.Route)
+	if !ok {
+		return
+	}
+	base := filepath.Dir(m.Config.Resolve(route.Source))
+	waitingTarget := filepath.Join(base, "waiting", filepath.Base(lease.File))
+	note := fmt.Sprintf("quota wall on %s; parked until %s; attempt not spent", runner, resetTimeStr)
+	update := func(fm map[string]any) {
+		fm["quota_reset_at"] = resetTimeStr
+		fm["wake_at"] = resetTimeStr
+		fm[resumeCreditField] = true
+	}
+	if moveErr := moveDocumentWithUpdate(lease.File, waitingTarget, "waiting", now, note, update); moveErr != nil {
+		m.log("move quota error document to waiting: " + moveErr.Error())
+		return
+	}
+	_ = os.Remove(m.leasePath(lease.ID))
+	m.finishRuntimeJob(lease.ID)
+	m.log(fmt.Sprintf("%s: %s", note, waitingTarget))
 }

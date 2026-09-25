@@ -109,11 +109,17 @@ func TestWakeResumedParkDoesNotSpendAnAttempt(t *testing.T) {
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
 		fm["waiting_for"] = "the nightly build to publish"
-		fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		fm["wake_at"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	})
 
 	scanAndWait(t, manager) // claim attempt 1; the turn parks it
-	scanAndWait(t, manager) // reconcile the park, wake it, claim it again
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	editFrontMatter(t, filepath.Join(base, "waiting", name), func(fm map[string]any) {
+		fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	})
+	scanAndWait(t, manager) // wake it and claim it again
 
 	working := filepath.Join(base, "working", name)
 	document, lease := claimedAttempt(t, manager, working)
@@ -185,14 +191,17 @@ func TestReviewerParkResumesTheAcceptedImplementationAttempt(t *testing.T) {
 			reviewing := filepath.Join(base, "reviewing", name)
 			editFrontMatter(t, reviewing, func(fm map[string]any) {
 				fm["waiting_for"] = "the in-game grade"
-				fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+				fm["wake_at"] = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 			})
 			_ = moveDocument(reviewing, filepath.Join(base, "waiting", name), "waiting", time.Now().UTC())
 		}
 	}
-	for scan := 0; scan < 3; scan++ {
-		scanAndWait(t, manager)
-	}
+	scanAndWait(t, manager) // 1: implementation submits for review
+	scanAndWait(t, manager) // 2: review accepts and parks
+	editFrontMatter(t, filepath.Join(base, "waiting", name), func(fm map[string]any) {
+		fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	})
+	scanAndWait(t, manager) // 3: wakes from waiting and claims implementation
 	document, lease := claimedAttempt(t, manager, filepath.Join(base, "working", name))
 	if got := numberValue(document.FrontMatter["attempt"]); got != 1 || lease.ClaimAttempt != 1 {
 		t.Fatalf("implementation attempt after a reviewer park = %d (lease %d), want 1", got, lease.ClaimAttempt)

@@ -956,7 +956,7 @@ func TestRepeatedlyEmptyTurnsStopUsingTheQuickRecoveryPath(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
 	awaitingTransitionOrphan(t, cfg, manager, "stop retrying a runner that never starts", 3*time.Minute, quickAwaitingTransitionRecoveries)
 
-	if err := manager.ScanOnce(context.Background()); err != nil {
+	if err := manager.recoverStale(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	manager.Wait()
@@ -965,8 +965,8 @@ func TestRepeatedlyEmptyTurnsStopUsingTheQuickRecoveryPath(t *testing.T) {
 		t.Fatalf("exhausted quick recovery still dispatched: calls=%d", fake.calls)
 	}
 	leases, err := manager.loadLeases()
-	if err != nil || len(leases) != 1 || leases[0].RecoveryCount != quickAwaitingTransitionRecoveries {
-		t.Fatalf("lease was disturbed past the quick-recovery bound: %#v, %v", leases, err)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("lease still exists after requeue: %#v, %v", leases, err)
 	}
 }
 
@@ -998,7 +998,7 @@ func TestStrandedTaskGetsOneRecoveryThenRequeuesAsAttempt(t *testing.T) {
 	}
 
 	// Second scan: quick recovery exhausted (1 >= 1) -> requeues to todo/ as ordinary new attempt
-	if err := manager.ScanOnce(context.Background()); err != nil {
+	if err := manager.recoverStale(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	manager.Wait()
@@ -1238,6 +1238,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 			fm["waiting_for"] = "prose only description"
 		})
 		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		// Must be rejected and redirected back to todo/
 		todoPath := filepath.Join(base, "todo", name)
@@ -1279,6 +1282,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 			fm["wake_at"] = time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
 		})
 		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		todoPath := filepath.Join(base, "todo", name)
 		doc, err := ReadDocument(todoPath)
@@ -1305,6 +1311,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 			fm["wake_at"] = time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
 		})
 		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		waitingPath := filepath.Join(base, "waiting", name)
 		doc, err := ReadDocument(waitingPath)
@@ -1331,6 +1340,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 			fm["joey_ask"] = map[string]any{"kind": "choice", "prompt": "Approve?"}
 		})
 		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		waitingPath := filepath.Join(base, "waiting", name)
 		doc, err := ReadDocument(waitingPath)
@@ -1370,6 +1382,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 		}
 		scanAndWait(t, manager) // claim implementation, move to review
 		scanAndWait(t, manager) // claim review, park without routable path
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		todoPath := filepath.Join(base, "todo", name)
 		doc, err := ReadDocument(todoPath)
@@ -1413,7 +1428,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 		}
 		_ = manager.saveLease(lease)
 
-		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		proposedPath := filepath.Join(base, "proposed", name)
 		doc, err := ReadDocument(proposedPath)
@@ -1460,7 +1477,9 @@ func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
 		}
 		_ = manager.saveLease(lease)
 
-		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 
 		reviewPath := filepath.Join(base, "review", name)
 		doc, err := ReadDocument(reviewPath)
