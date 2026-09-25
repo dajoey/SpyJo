@@ -28,6 +28,16 @@ import (
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
+func defaultUsageSnapshotPath() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		home = "/home/dajoey"
+	}
+	return filepath.Join(home, "ops", "state", "ai-usage", "snapshot.json")
+}
+
+var usageSnapshotPath = defaultUsageSnapshotPath()
+
 type Lease struct {
 	ID                string    `json:"id"`
 	ClaimID           string    `json:"claim_id,omitempty"`
