@@ -15,6 +15,10 @@ import (
 const (
 	maxPendingControls  = 8
 	controlDedupeWindow = time.Minute
+	// interruptRegistrationWait bounds how long an interrupt that arrived while
+	// its target turn was still registering waits for that registration before
+	// reporting that nothing was stopped.
+	interruptRegistrationWait = 15 * time.Second
 )
 
 // Supervisor keeps the rest of Spynel provider-neutral while allowing the
@@ -838,8 +842,19 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 
 func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 	operation := s.controlOperation(key)
-	operation.Lock()
-	defer operation.Unlock()
+	// A running turn holds the key's operation lock for its entire duration
+	// (send and startQueued), so an interrupt that queued behind it only fired
+	// after the work it was meant to stop had already finished — the 2026-09-25
+	// job-kill wedge: `job kill` hung and the worker pane kept generating until
+	// its own turn ended. When the lock is busy the holder is the turn itself,
+	// so proceed without it: every state mutation below stays under s.mu and a
+	// target Interrupt is safe against a live turn. When the lock is free no
+	// turn is running; holding it across cleanup keeps a successor send fenced
+	// behind the interrupt (TestSupervisorSerializesSuccessorSendAfterInterruptCleanup).
+	locked := operation.TryLock()
+	if locked {
+		defer operation.Unlock()
+	}
 	target, err := s.target()
 	if err != nil {
 		return false, err
@@ -856,6 +871,13 @@ func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 	s.mu.Unlock()
 	cancelQueuedRequests(queue...)
 	stopped, err := target.Interrupt(ctx, key)
+	if err == nil && !stopped && !locked && logicalActive {
+		// The turn passed admission but has not registered with the target yet
+		// (its worker is still spawning). Without the operation lock nothing
+		// orders this interrupt after that registration, so poll briefly and
+		// interrupt the turn as soon as it appears.
+		stopped, err = s.interruptOnceRegistered(ctx, target, key)
+	}
 	if err != nil {
 		if !target.IsActive(key) {
 			s.mu.Lock()
@@ -874,6 +896,26 @@ func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 		s.mu.Unlock()
 	}
 	return stopped || logicalActive, err
+}
+
+// interruptOnceRegistered covers the admission-to-registration window: the
+// supervisor already counts the turn as active but the target has not exposed
+// it yet, so a plain Interrupt would sail past and leave the new turn running.
+func (s *Supervisor) interruptOnceRegistered(ctx context.Context, target Harness, key string) (bool, error) {
+	deadline := time.Now().Add(interruptRegistrationWait)
+	for {
+		if target.IsActive(key) {
+			return target.Interrupt(ctx, key)
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Supervisor) ResetSession(key string) error {

@@ -32,6 +32,11 @@ type supervisorHarness struct {
 	isActiveEntered  chan struct{}
 	isActiveRelease  <-chan struct{}
 	isActiveOnce     sync.Once
+	turnGate         chan struct{}
+	turnStarted      chan struct{}
+	activateDelay    time.Duration
+	turnGateOnce     sync.Once
+	turnStartedOnce  sync.Once
 }
 
 type inferenceSupervisorHarness struct {
@@ -115,7 +120,7 @@ func (r *supervisorHarness) SetModel(model string) {
 	r.configuredModel = model
 	r.mu.Unlock()
 }
-func (r *supervisorHarness) SendWithModel(_ context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+func (r *supervisorHarness) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	r.mu.Lock()
 	if r.active[key] && r.refuseSteer {
 		r.mu.Unlock()
@@ -129,10 +134,33 @@ func (r *supervisorHarness) SendWithModel(_ context.Context, key, prompt, model 
 		r.models = map[string][]string{}
 	}
 	r.models[key] = append(r.models[key], model)
+	if r.turnGate == nil {
+		r.active[key] = true
+		r.emits[key] = emit
+		r.mu.Unlock()
+		return r.name + "-thread", false, nil
+	}
+	r.mu.Unlock()
+	if r.turnStarted != nil {
+		r.turnStartedOnce.Do(func() { close(r.turnStarted) })
+	}
+	if r.activateDelay > 0 {
+		select {
+		case <-time.After(r.activateDelay):
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		}
+	}
+	r.mu.Lock()
 	r.active[key] = true
 	r.emits[key] = emit
 	r.mu.Unlock()
-	return r.name + "-thread", false, nil
+	select {
+	case <-r.turnGate:
+		return r.name + "-thread", false, nil
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	}
 }
 
 func (r *supervisorHarness) finish(key string) {
@@ -155,6 +183,9 @@ func (r *supervisorHarness) Interrupt(_ context.Context, key string) (bool, erro
 		return false, nil
 	}
 	delete(r.active, key)
+	if r.turnGate != nil {
+		r.turnGateOnce.Do(func() { close(r.turnGate) })
+	}
 	if r.interruptEntered != nil {
 		close(r.interruptEntered)
 		<-r.interruptRelease
@@ -218,6 +249,104 @@ func TestSupervisorSerializesSuccessorSendAfterInterruptCleanup(t *testing.T) {
 	}
 	if !supervisor.IsActive("job") || !target.IsActive("job") {
 		t.Fatalf("successor turn was hidden: supervisor=%t target=%t", supervisor.IsActive("job"), target.IsActive("job"))
+	}
+}
+
+func TestSupervisorInterruptDoesNotBlockBehindActiveTurn(t *testing.T) {
+	target := &supervisorHarness{
+		name: "codex", active: map[string]bool{}, emits: map[string]core.Emit{},
+		turnGate: make(chan struct{}), turnStarted: make(chan struct{}),
+	}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		_, _, err := supervisor.Send(context.Background(), "job", "long turn", nil)
+		sendDone <- err
+	}()
+	select {
+	case <-target.turnStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn never started")
+	}
+	waitSupervisorState(t, func() bool { return target.IsActive("job") })
+	interruptDone := make(chan error, 1)
+	go func() {
+		stopped, err := supervisor.Interrupt(context.Background(), "job")
+		if err == nil && !stopped {
+			err = errors.New("interrupt did not stop the active turn")
+		}
+		interruptDone <- err
+	}()
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupt queued behind the active turn it was meant to stop: the per-key operation lock is held for the turn's whole duration")
+	}
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupted turn did not unwind")
+	}
+}
+
+func TestSupervisorInterruptCoversTurnRegistrationWindow(t *testing.T) {
+	target := &supervisorHarness{
+		name: "codex", active: map[string]bool{}, emits: map[string]core.Emit{},
+		turnGate: make(chan struct{}), turnStarted: make(chan struct{}), activateDelay: 300 * time.Millisecond,
+	}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		_, _, err := supervisor.Send(context.Background(), "job", "spawning turn", nil)
+		sendDone <- err
+	}()
+	select {
+	case <-target.turnStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn never started")
+	}
+	if target.IsActive("job") {
+		t.Fatal("fixture registered the turn before its spawn delay elapsed")
+	}
+	interruptDone := make(chan error, 1)
+	go func() {
+		stopped, err := supervisor.Interrupt(context.Background(), "job")
+		if err == nil && !stopped {
+			err = errors.New("interrupt lost a turn that registered mid-interrupt")
+		}
+		interruptDone <- err
+	}()
+	select {
+	case err := <-interruptDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("interrupt did not cover the admission-to-registration window")
+	}
+	select {
+	case err := <-sendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interrupted turn did not unwind")
 	}
 }
 
