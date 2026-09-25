@@ -1535,6 +1535,14 @@ func (m *Manager) hasLeaseForFile(path string) bool {
 	return false
 }
 
+// HasLeaseForFile reports whether any persisted lease claims the file path.
+func (m *Manager) HasLeaseForFile(path string) bool {
+	if m == nil {
+		return false
+	}
+	return m.hasLeaseForFile(path)
+}
+
 func (m *Manager) leaseForDocument(routeName, name, phase, exceptID string) (Lease, bool, error) {
 	leases, err := m.loadLeases()
 	if err != nil {

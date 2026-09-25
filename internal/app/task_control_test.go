@@ -540,3 +540,380 @@ func TestTaskControlStopJobEndsWithinGraceWhenTurnNeverResolves(t *testing.T) {
 	}
 }
 
+func stageTaskInFolder(t *testing.T, service *Service, taskID, folder string, frontMatter map[string]any) string {
+	t.Helper()
+	dir := service.Config.StatePath("tasks", folder)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, taskID+".md")
+	if frontMatter == nil {
+		frontMatter = map[string]any{}
+	}
+	frontMatter["id"] = taskID
+	if _, ok := frontMatter["status"]; !ok {
+		frontMatter["status"] = folder
+	}
+	if _, ok := frontMatter["title"]; !ok {
+		frontMatter["title"] = "Task fixture in " + folder
+	}
+	if _, ok := frontMatter["created_at"]; !ok {
+		frontMatter["created_at"] = "2026-09-25T08:00:00Z"
+	}
+	if _, ok := frontMatter["updated_at"]; !ok {
+		frontMatter["updated_at"] = "2026-09-25T08:00:00Z"
+	}
+	doc := orchestrator.Document{FrontMatter: frontMatter, Body: "# Task in " + folder + "\n\n## Progress\n\n- staged\n"}
+	if err := orchestrator.WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func claimTaskForReview(t *testing.T, service *Service, taskID string, attempt int, frontMatter map[string]any) (string, orchestrator.Lease) {
+	t.Helper()
+	dir := service.Config.StatePath("tasks", "reviewing")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, taskID+".md")
+	if frontMatter == nil {
+		frontMatter = map[string]any{}
+	}
+	frontMatter["id"] = taskID
+	frontMatter["status"] = "reviewing"
+	frontMatter["title"] = "Reviewing fixture"
+	frontMatter["created_at"] = "2026-09-25T08:00:00Z"
+	frontMatter["updated_at"] = "2026-09-25T08:00:00Z"
+	frontMatter["attempt"] = 1
+	frontMatter["review_attempt"] = attempt
+	doc := orchestrator.Document{FrontMatter: frontMatter, Body: "# Reviewing\n\n## Progress\n\n- reviewing\n"}
+	if err := orchestrator.WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	lease := orchestrator.Lease{
+		ID: "lease-review-" + taskID, OwnerID: "owner-review-" + taskID,
+		SessionKey: fmt.Sprintf("orchestrator:tasks:task_review:%s:%d", taskID, attempt),
+		File:       path, Route: "tasks", State: "processing", Phase: "task_review",
+		StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(), ClaimAttempt: attempt,
+	}
+	writeJobLease(t, service, lease)
+	service.Runtime.BeginJobWithDetails(lease.SessionKey, "orchestrator", "markdown", taskID+".md", JobDetails{
+		Kind: "task", Route: "tasks", DurableFile: path,
+	})
+	return path, lease
+}
+
+func TestTaskControlApproveSettlesReviewStateTaskDone(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-approve-demo"
+	reviewPath := stageTaskInFolder(t, service, taskID, "review", map[string]any{
+		"review_required": true,
+	})
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "approve",
+		Text:   "Looks great, approved",
+	})
+	if err != nil {
+		t.Fatalf("approve failed: %v", err)
+	}
+	if !result.OK || result.State != "done" || result.Settled != "done" {
+		t.Fatalf("approve result = %#v", result)
+	}
+
+	// File must be gone from review/ and present in done/
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Fatalf("file still exists in review/: %v", err)
+	}
+	donePath := filepath.Join(service.Config.StatePath("tasks", "done"), taskID+".md")
+	doc, err := orchestrator.ReadDocument(donePath)
+	if err != nil {
+		t.Fatalf("failed reading done document: %v", err)
+	}
+
+	if doc.FrontMatter["status"] != "done" {
+		t.Errorf("status = %v, want done", doc.FrontMatter["status"])
+	}
+	if req, ok := doc.FrontMatter["review_required"].(bool); ok && req {
+		t.Errorf("review_required was not cleared: %v", req)
+	}
+
+	// Verify completion summary
+	summary, ok := doc.FrontMatter["completion_summary"].(map[string]any)
+	if !ok {
+		t.Fatalf("completion_summary missing or not a map: %#v", doc.FrontMatter["completion_summary"])
+	}
+	if summary["verdict"] != "completed" {
+		t.Errorf("summary verdict = %v, want completed", summary["verdict"])
+	}
+	if summary["completed_at"] == "" || summary["completed_at"] != doc.FrontMatter["updated_at"] {
+		t.Errorf("completed_at (%v) != updated_at (%v)", summary["completed_at"], doc.FrontMatter["updated_at"])
+	}
+
+	// Progress must mention operator review verdict
+	if !strings.Contains(doc.Body, "Operator review verdict (Helm web conversation): Approved") {
+		t.Errorf("progress note missing operator approval: %s", doc.Body)
+	}
+}
+
+func TestTaskControlRequestChangesReturnsSameTaskIDToTodoWithRework(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-request-changes-demo"
+	reviewPath := stageTaskInFolder(t, service, taskID, "review", map[string]any{
+		"review_required": true,
+		"rework_count":    0,
+	})
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "request-changes",
+		Text:   "Please fix the error handling in foo.go",
+	})
+	if err != nil {
+		t.Fatalf("request-changes failed: %v", err)
+	}
+	if !result.OK || result.State != "todo" || result.Settled != "todo" {
+		t.Fatalf("request-changes result = %#v", result)
+	}
+
+	// File must be moved to todo/ with same task ID
+	if _, err := os.Stat(reviewPath); !os.IsNotExist(err) {
+		t.Fatalf("file still exists in review/: %v", err)
+	}
+	todoPath := filepath.Join(service.Config.StatePath("tasks", "todo"), taskID+".md")
+	doc, err := orchestrator.ReadDocument(todoPath)
+	if err != nil {
+		t.Fatalf("failed reading todo document: %v", err)
+	}
+
+	if doc.FrontMatter["status"] != "todo" {
+		t.Errorf("status = %v, want todo", doc.FrontMatter["status"])
+	}
+	// rework_count must be incremented to 1
+	if rework, ok := doc.FrontMatter["rework_count"].(int); !ok || rework != 1 {
+		t.Errorf("rework_count = %v (type %T), want 1", doc.FrontMatter["rework_count"], doc.FrontMatter["rework_count"])
+	}
+	if !strings.Contains(doc.Body, "Requested changes at") || !strings.Contains(doc.Body, "Please fix the error handling in foo.go") {
+		t.Errorf("progress note missing revision instruction: %s", doc.Body)
+	}
+}
+
+func TestTaskControlRequestChangesRequiresNonEmptyText(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-req-empty"
+	stageTaskInFolder(t, service, taskID, "review", nil)
+
+	_, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "request-changes",
+		Text:   "   ",
+	})
+	if err == nil {
+		t.Fatal("expected error on empty revision instruction")
+	}
+	if code := taskControlCode(err); code != "bad_request" {
+		t.Errorf("code = %q, want bad_request", code)
+	}
+}
+
+func TestTaskControlClaimedReviewingRejectsApproveAndRequestChanges(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-claimed-reviewing"
+	reviewingPath, _ := claimTaskForReview(t, service, taskID, 1, nil)
+
+	// approve while claimed in reviewing must fail with review_in_progress
+	_, errApprove := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "approve",
+	})
+	if errApprove == nil {
+		t.Fatal("expected error approving claimed review")
+	}
+	if code := taskControlCode(errApprove); code != "review_in_progress" {
+		t.Errorf("code = %q, want review_in_progress", code)
+	}
+
+	// request-changes while claimed in reviewing must fail with review_in_progress
+	_, errReq := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "request-changes",
+		Text:   "rejecting mid-review",
+	})
+	if errReq == nil {
+		t.Fatal("expected error requesting changes on claimed review")
+	}
+	if code := taskControlCode(errReq); code != "review_in_progress" {
+		t.Errorf("code = %q, want review_in_progress", code)
+	}
+
+	// File must remain untouched in reviewing/
+	if _, err := os.Stat(reviewingPath); err != nil {
+		t.Fatalf("reviewing file was modified or removed: %v", err)
+	}
+}
+
+func TestTaskControlSnoozeSetsWakeAtOnWaitingTask(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-snooze-demo"
+	waitingPath := stageTaskInFolder(t, service, taskID, "waiting", map[string]any{
+		"waiting_for": "an event",
+	})
+
+	wakeAt := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "snooze",
+		WakeAt: wakeAt,
+	})
+	if err != nil {
+		t.Fatalf("snooze failed: %v", err)
+	}
+	if !result.OK || result.State != "waiting" || result.WakeAt != wakeAt {
+		t.Fatalf("snooze result = %#v", result)
+	}
+
+	doc, err := orchestrator.ReadDocument(waitingPath)
+	if err != nil {
+		t.Fatalf("read waiting doc failed: %v", err)
+	}
+	if doc.FrontMatter["wake_at"] != wakeAt {
+		t.Errorf("wake_at = %v, want %s", doc.FrontMatter["wake_at"], wakeAt)
+	}
+	if !strings.Contains(doc.Body, "Snoozed until "+wakeAt) {
+		t.Errorf("progress note missing snooze log: %s", doc.Body)
+	}
+}
+
+func TestTaskControlWakeNowReturnsWaitingTaskToTodo(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-wake-now-demo"
+	wakeAt := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	waitingPath := stageTaskInFolder(t, service, taskID, "waiting", map[string]any{
+		"waiting_for": "an event",
+		"wake_at":     wakeAt,
+	})
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "wake-now",
+	})
+	if err != nil {
+		t.Fatalf("wake-now failed: %v", err)
+	}
+	if !result.OK || result.State != "todo" || result.Settled != "todo" {
+		t.Fatalf("wake-now result = %#v", result)
+	}
+
+	// Must be moved from waiting/ to todo/
+	if _, err := os.Stat(waitingPath); !os.IsNotExist(err) {
+		t.Fatalf("file still in waiting/: %v", err)
+	}
+	todoPath := filepath.Join(service.Config.StatePath("tasks", "todo"), taskID+".md")
+	doc, err := orchestrator.ReadDocument(todoPath)
+	if err != nil {
+		t.Fatalf("read todo doc failed: %v", err)
+	}
+	if doc.FrontMatter["status"] != "todo" {
+		t.Errorf("status = %v, want todo", doc.FrontMatter["status"])
+	}
+	if _, ok := doc.FrontMatter["wake_at"]; ok {
+		t.Errorf("wake_at was not removed: %v", doc.FrontMatter["wake_at"])
+	}
+	if !strings.Contains(doc.Body, "Woke now; returned to todo/") {
+		t.Errorf("progress note missing wake now log: %s", doc.Body)
+	}
+}
+
+func TestTaskControlReassignRewritesStaffSurgically(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-reassign-demo"
+	origContent := `---
+# Important heading comment
+attempt: 1
+created_at: "2026-09-25T08:00:00Z"
+id: tasks-20260925-reassign-demo
+review_required: true
+risk: high
+staff: cursor # legacy seat
+status: working
+title: Task fixture
+updated_at: "2026-09-25T08:00:00Z"
+---
+
+# Task body
+Untouched body.
+
+## Progress
+
+- claimed
+`
+	workingDir := service.Config.StatePath("tasks", "working")
+	_ = os.MkdirAll(workingDir, 0o700)
+	taskPath := filepath.Join(workingDir, taskID+".md")
+	if err := os.WriteFile(taskPath, []byte(origContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "reassign",
+		Staff:  "agy",
+	})
+	if err != nil {
+		t.Fatalf("reassign failed: %v", err)
+	}
+	if !result.OK || result.Staff != "agy" {
+		t.Fatalf("reassign result = %#v", result)
+	}
+
+	rawBytes, err := os.ReadFile(taskPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(rawBytes)
+
+	if !strings.Contains(raw, "staff: agy\n") {
+		t.Errorf("expected staff: agy, got:\n%s", raw)
+	}
+	if !strings.Contains(raw, "# Important heading comment") {
+		t.Errorf("heading comment lost")
+	}
+	if !strings.Contains(raw, "Untouched body.") {
+		t.Errorf("body modified")
+	}
+	if !strings.Contains(raw, "Reassigned staff to agy.") {
+		t.Errorf("progress log missing reassign line: %s", raw)
+	}
+}
+
+func TestTaskControlSnoozeAndWakeNowRejectNonWaitingTask(t *testing.T) {
+	service, _ := newTaskControlService(t)
+	taskID := "tasks-20260925-non-waiting"
+	stageTaskInFolder(t, service, taskID, "working", nil)
+
+	_, errSnooze := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "snooze",
+		WakeAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+	if errSnooze == nil {
+		t.Fatal("expected error on snooze for non-waiting task")
+	}
+	if code := taskControlCode(errSnooze); code != "not_steerable" {
+		t.Errorf("code = %q, want not_steerable", code)
+	}
+
+	_, errWake := service.TaskControl(context.Background(), TaskControlRequest{
+		TaskID: taskID,
+		Action: "wake-now",
+	})
+	if errWake == nil {
+		t.Fatal("expected error on wake-now for non-waiting task")
+	}
+	if code := taskControlCode(errWake); code != "not_steerable" {
+		t.Errorf("code = %q, want not_steerable", code)
+	}
+}
+

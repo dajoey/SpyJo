@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 )
@@ -35,6 +38,8 @@ type TaskControlRequest struct {
 	ControlID string `json:"control_id,omitempty"`
 	Addressee string `json:"addressee,omitempty"`
 	Tail      int    `json:"tail,omitempty"`
+	Staff     string `json:"staff,omitempty"`
+	WakeAt    string `json:"wake_at,omitempty"`
 }
 
 // TaskControlResult is the JSON reply. Zero-valued fields are omitted.
@@ -53,6 +58,8 @@ type TaskControlResult struct {
 	Output    string `json:"output,omitempty"`
 	State     string `json:"state,omitempty"`
 	Settled   string `json:"settled,omitempty"`
+	Staff     string `json:"staff,omitempty"`
+	WakeAt    string `json:"wake_at,omitempty"`
 }
 
 type taskControlError struct {
@@ -136,6 +143,39 @@ func (s *Service) resolveTaskControlJob(taskID string) (Job, orchestrator.Lease,
 	return best, lease, documentID, phase, nil
 }
 
+// findTaskDocument resolves a task id to its location on disk across status folders.
+func (s *Service) findTaskDocument(taskID string) (string, string, orchestrator.Document, error) {
+	folders := []string{"working", "reviewing", "review", "waiting", "todo", "done", "cancelled", "failed"}
+	for _, folder := range folders {
+		candidate := filepath.Join(s.Config.StatePath("tasks", folder), taskID+".md")
+		if doc, err := orchestrator.ReadDocument(candidate); err == nil {
+			id, _ := doc.FrontMatter["id"].(string)
+			if id == taskID || id == "" {
+				return candidate, folder, doc, nil
+			}
+		}
+	}
+	for _, folder := range folders {
+		dir := s.Config.StatePath("tasks", folder)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || entry.Name() == "AGENTS.md" {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			if doc, err := orchestrator.ReadDocument(path); err == nil {
+				if id, _ := doc.FrontMatter["id"].(string); id == taskID {
+					return path, folder, doc, nil
+				}
+			}
+		}
+	}
+	return "", "", orchestrator.Document{}, taskControlErrorf("not_found", "no task found resolving task id %q", taskID)
+}
+
 // TaskControl executes one task-id-addressed control action. It never becomes
 // the job's emitter or owner: delivery, stopping, and settling reuse the
 // existing job-control and orchestrator-transition machinery.
@@ -155,6 +195,297 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 	}
 	if tail < 1 || tail > maxTaskControlTail {
 		return TaskControlResult{}, taskControlErrorf("bad_request", "tail must be from 1 to %d bytes", maxTaskControlTail)
+	}
+
+	switch action {
+	case "approve":
+		taskPath, folder, doc, err := s.findTaskDocument(taskID)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		if folder == "reviewing" || (s.Orchestrator != nil && s.Orchestrator.HasLeaseForFile(taskPath)) {
+			return TaskControlResult{}, taskControlErrorf("review_in_progress", "task %q is actively being reviewed under active lease; review is in progress", taskID)
+		}
+		if folder != "review" {
+			return TaskControlResult{}, taskControlErrorf("not_steerable", "task %q is in %s, not review", taskID, folder)
+		}
+
+		now := time.Now().UTC()
+		stamp := now.Format(time.RFC3339)
+		destDir := s.Config.StatePath("tasks", "done")
+		if err := os.MkdirAll(destDir, 0o700); err != nil {
+			return TaskControlResult{}, err
+		}
+		targetPath := filepath.Join(destDir, filepath.Base(taskPath))
+
+		contentBytes, err := os.ReadFile(taskPath)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content := string(contentBytes)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "status", "done")
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, err = SurgicallyUpdateFrontMatterField(content, "updated_at", fmt.Sprintf("%q", stamp))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		if req, ok := doc.FrontMatter["review_required"].(bool); ok && req {
+			content, err = SurgicallyUpdateFrontMatterField(content, "review_required", "false")
+			if err != nil {
+				return TaskControlResult{}, err
+			}
+		}
+
+		summaryStr := fmt.Sprintf("\n    completed_at: %q\n    evidence: \"Operator review verdict (Approve) on the Helm web conversation at %s; settled done by operator authority.\"\n    outcome: \"Operator approved this task from the Helm web conversation.\"\n    uncertainty: \"Approved by operator decision; accepted without independent reviewer rework.\"\n    verdict: completed", stamp, stamp)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "completion_summary", summaryStr)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		progressNote := fmt.Sprintf("Operator review verdict (Helm web conversation): Approved at %s. Authority: the operator's Approve action on the conversation.", stamp)
+		if strings.TrimSpace(text) != "" {
+			progressNote += fmt.Sprintf(" Note: %s", strings.TrimSpace(text))
+		}
+		content = SurgicallyAppendProgress(content, progressNote, now)
+
+		if err := fsx.AtomicWriteFile(targetPath, []byte(content), 0o600); err != nil {
+			return TaskControlResult{}, err
+		}
+		_ = os.Remove(taskPath)
+
+		return TaskControlResult{
+			OK:      true,
+			Action:  action,
+			TaskID:  taskID,
+			State:   "done",
+			Settled: "done",
+		}, nil
+
+	case "request-changes":
+		if strings.TrimSpace(text) == "" {
+			return TaskControlResult{}, taskControlErrorf("bad_request", "revision note is required for request-changes")
+		}
+		taskPath, folder, doc, err := s.findTaskDocument(taskID)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		if folder == "reviewing" || (s.Orchestrator != nil && s.Orchestrator.HasLeaseForFile(taskPath)) {
+			return TaskControlResult{}, taskControlErrorf("review_in_progress", "task %q is actively being reviewed under active lease; review is in progress", taskID)
+		}
+		if folder != "review" {
+			return TaskControlResult{}, taskControlErrorf("not_steerable", "task %q is in %s, not review", taskID, folder)
+		}
+
+		now := time.Now().UTC()
+		stamp := now.Format(time.RFC3339)
+		destDir := s.Config.StatePath("tasks", "todo")
+		if err := os.MkdirAll(destDir, 0o700); err != nil {
+			return TaskControlResult{}, err
+		}
+		targetPath := filepath.Join(destDir, filepath.Base(taskPath))
+
+		contentBytes, err := os.ReadFile(taskPath)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content := string(contentBytes)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "status", "todo")
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, err = SurgicallyUpdateFrontMatterField(content, "updated_at", fmt.Sprintf("%q", stamp))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		rework := 0
+		if val, ok := doc.FrontMatter["rework_count"]; ok {
+			switch v := val.(type) {
+			case int:
+				rework = v
+			case int64:
+				rework = int(v)
+			case float64:
+				rework = int(v)
+			}
+		}
+		rework++
+		content, err = SurgicallyUpdateFrontMatterField(content, "rework_count", strconv.Itoa(rework))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		progressNote := fmt.Sprintf("Operator review verdict (Helm web conversation): Requested changes at %s. Revision instruction: %s", stamp, strings.TrimSpace(text))
+		content = SurgicallyAppendProgress(content, progressNote, now)
+
+		if err := fsx.AtomicWriteFile(targetPath, []byte(content), 0o600); err != nil {
+			return TaskControlResult{}, err
+		}
+		_ = os.Remove(taskPath)
+
+		return TaskControlResult{
+			OK:      true,
+			Action:  action,
+			TaskID:  taskID,
+			State:   "todo",
+			Settled: "todo",
+		}, nil
+
+	case "reassign":
+		staff := strings.TrimSpace(input.Staff)
+		if staff == "" {
+			staff = strings.TrimSpace(input.Text)
+		}
+		if staff == "" {
+			return TaskControlResult{}, taskControlErrorf("bad_request", "staff name is required for reassign")
+		}
+		taskPath, folder, _, err := s.findTaskDocument(taskID)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		now := time.Now().UTC()
+		stamp := now.Format(time.RFC3339)
+
+		contentBytes, err := os.ReadFile(taskPath)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content := string(contentBytes)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "staff", staff)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, err = SurgicallyUpdateFrontMatterField(content, "updated_at", fmt.Sprintf("%q", stamp))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		progressNote := fmt.Sprintf("Operator control (Helm web conversation): Reassigned staff to %s.", staff)
+		content = SurgicallyAppendProgress(content, progressNote, now)
+
+		if err := fsx.AtomicWriteFile(taskPath, []byte(content), 0o600); err != nil {
+			return TaskControlResult{}, err
+		}
+
+		return TaskControlResult{
+			OK:     true,
+			Action: action,
+			TaskID: taskID,
+			State:  folder,
+			Staff:  staff,
+		}, nil
+
+	case "snooze":
+		wakeAtStr := strings.TrimSpace(input.WakeAt)
+		if wakeAtStr == "" {
+			wakeAtStr = strings.TrimSpace(input.Text)
+		}
+		if wakeAtStr == "" {
+			return TaskControlResult{}, taskControlErrorf("bad_request", "wake_at is required for snooze")
+		}
+		due, err := time.Parse(time.RFC3339, wakeAtStr)
+		if err != nil {
+			return TaskControlResult{}, taskControlErrorf("bad_request", "wake_at must be a valid RFC 3339 timestamp: %v", err)
+		}
+		now := time.Now().UTC()
+		if !due.After(now) {
+			return TaskControlResult{}, taskControlErrorf("bad_request", "wake_at must be in the future (got %s, now is %s)", wakeAtStr, now.Format(time.RFC3339))
+		}
+
+		taskPath, folder, _, err := s.findTaskDocument(taskID)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		if folder != "waiting" {
+			return TaskControlResult{}, taskControlErrorf("not_steerable", "task %q is in %s, not waiting", taskID, folder)
+		}
+
+		contentBytes, err := os.ReadFile(taskPath)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content := string(contentBytes)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "wake_at", fmt.Sprintf("%q", wakeAtStr))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, err = SurgicallyUpdateFrontMatterField(content, "updated_at", fmt.Sprintf("%q", now.Format(time.RFC3339)))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+
+		progressNote := fmt.Sprintf("Operator control (Helm web conversation): Snoozed until %s.", wakeAtStr)
+		content = SurgicallyAppendProgress(content, progressNote, now)
+
+		if err := fsx.AtomicWriteFile(taskPath, []byte(content), 0o600); err != nil {
+			return TaskControlResult{}, err
+		}
+
+		return TaskControlResult{
+			OK:     true,
+			Action: action,
+			TaskID: taskID,
+			State:  "waiting",
+			WakeAt: wakeAtStr,
+		}, nil
+
+	case "wake-now":
+		taskPath, folder, _, err := s.findTaskDocument(taskID)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		if folder != "waiting" {
+			return TaskControlResult{}, taskControlErrorf("not_steerable", "task %q is in %s, not waiting", taskID, folder)
+		}
+
+		now := time.Now().UTC()
+		stamp := now.Format(time.RFC3339)
+		destDir := s.Config.StatePath("tasks", "todo")
+		if err := os.MkdirAll(destDir, 0o700); err != nil {
+			return TaskControlResult{}, err
+		}
+		targetPath := filepath.Join(destDir, filepath.Base(taskPath))
+
+		contentBytes, err := os.ReadFile(taskPath)
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content := string(contentBytes)
+
+		content, err = SurgicallyUpdateFrontMatterField(content, "status", "todo")
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, err = SurgicallyUpdateFrontMatterField(content, "updated_at", fmt.Sprintf("%q", stamp))
+		if err != nil {
+			return TaskControlResult{}, err
+		}
+		content, _ = SurgicallyDeleteFrontMatterField(content, "wake_at")
+
+		progressNote := "Operator control (Helm web conversation): Woke now; returned to todo/ for fresh dispatch."
+		content = SurgicallyAppendProgress(content, progressNote, now)
+
+		if err := fsx.AtomicWriteFile(targetPath, []byte(content), 0o600); err != nil {
+			return TaskControlResult{}, err
+		}
+		_ = os.Remove(taskPath)
+
+		return TaskControlResult{
+			OK:      true,
+			Action:  action,
+			TaskID:  taskID,
+			State:   "todo",
+			Settled: "todo",
+		}, nil
 	}
 
 	job, lease, documentID, phase, err := s.resolveTaskControlJob(taskID)
@@ -290,7 +621,7 @@ func (s *Service) TaskControl(ctx context.Context, input TaskControlRequest) (Ta
 		return result, nil
 
 	default:
-		return TaskControlResult{}, taskControlErrorf("bad_request", "unknown action %q (message, interrupt, cancel-queued, output, stop, stop-done, stop-cancel)", action)
+		return TaskControlResult{}, taskControlErrorf("bad_request", "unknown action %q (message, interrupt, cancel-queued, output, stop, stop-done, stop-cancel, approve, request-changes, reassign, snooze, wake-now)", action)
 	}
 }
 
