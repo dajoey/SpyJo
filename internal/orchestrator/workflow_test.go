@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -955,7 +956,7 @@ func TestRepeatedlyEmptyTurnsStopUsingTheQuickRecoveryPath(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
 	awaitingTransitionOrphan(t, cfg, manager, "stop retrying a runner that never starts", 3*time.Minute, quickAwaitingTransitionRecoveries)
 
-	if err := manager.ScanOnce(context.Background()); err != nil {
+	if err := manager.recoverStale(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	manager.Wait()
@@ -964,10 +965,82 @@ func TestRepeatedlyEmptyTurnsStopUsingTheQuickRecoveryPath(t *testing.T) {
 		t.Fatalf("exhausted quick recovery still dispatched: calls=%d", fake.calls)
 	}
 	leases, err := manager.loadLeases()
-	if err != nil || len(leases) != 1 || leases[0].RecoveryCount != quickAwaitingTransitionRecoveries {
-		t.Fatalf("lease was disturbed past the quick-recovery bound: %#v, %v", leases, err)
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("lease still exists after requeue: %#v, %v", leases, err)
 	}
 }
+
+func TestStrandedTaskGetsOneRecoveryThenRequeuesAsAttempt(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	// 1. Initial stranded task in awaiting_transition (RecoveryCount = 0)
+	working := awaitingTransitionOrphan(t, cfg, manager, "stranded task gets one recovery then requeues", 3*time.Minute, 0)
+
+	// First scan: dispatches the single quick recovery
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+
+	if fake.calls != 1 {
+		t.Fatalf("expected 1 recovery dispatch, got %d", fake.calls)
+	}
+
+	// 2. Recovery turn ends without moving document (RecoveryCount = 1)
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("expected 1 lease after recovery dispatch, got %#v", leases)
+	}
+	lease := leases[0]
+	lease.State = "awaiting_transition"
+	lease.HeartbeatAt = time.Now().UTC().Add(-3 * time.Minute)
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second scan: quick recovery exhausted (1 >= 1) -> requeues to todo/ as ordinary new attempt
+	if err := manager.recoverStale(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+
+	if fake.calls != 1 {
+		t.Fatalf("stranded task dispatched another recovery instead of requeuing: calls=%d", fake.calls)
+	}
+
+	// Lease should be removed
+	leasesAfter, err := manager.loadLeases()
+	if err != nil || len(leasesAfter) != 0 {
+		t.Fatalf("lease still exists after requeue: %#v", leasesAfter)
+	}
+
+	// Task file moved to todo/
+	todoFile := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "todo", filepath.Base(working))
+	doc, err := ReadDocument(todoFile)
+	if err != nil {
+		t.Fatalf("task was not requeued to todo/: %v", err)
+	}
+	if doc.FrontMatter["status"] != "todo" {
+		t.Fatalf("requeued task status = %v, want todo", doc.FrontMatter["status"])
+	}
+	if credit, _ := doc.FrontMatter[resumeCreditField].(bool); credit {
+		t.Fatalf("requeued task has resume_credit set; must be ordinary new attempt")
+	}
+	if !strings.Contains(doc.Body, "requeued") {
+		t.Fatalf("requeue was not journaled in progress: %s", doc.Body)
+	}
+
+	// 3. Claiming this task now starts attempt 2
+	nextWorking := filepath.Join(cfg.Resolve(workflowRoutes()[0].Working), filepath.Base(working))
+	claimedDoc, err := ClaimDocument(todoFile, nextWorking, "working", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("claiming requeued task failed: %v", err)
+	}
+	attempt := numberValue(claimedDoc.FrontMatter["attempt"])
+	if attempt != 2 {
+		t.Fatalf("claimed attempt = %d, want 2", attempt)
+	}
+}
+
 
 // A turn that is still running owns its lease no matter how long it has been quiet:
 // an in-flight dispatch or a live harness session is never re-dispatched underneath.
@@ -1149,3 +1222,415 @@ func TestShutdownContextCancelDoesNotSpendAttempts(t *testing.T) {
 		t.Fatalf("attempt = %v, want 1", document.FrontMatter["attempt"])
 	}
 }
+
+func TestWaitingWithoutRoutablePathIsRejected(t *testing.T) {
+	// 1. Task implementation transition: prose-only waiting_for is rejected
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task implementation prose park rejected", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+			fm["waiting_for"] = "prose only description"
+		})
+		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Must be rejected and redirected back to todo/
+		todoPath := filepath.Join(base, "todo", name)
+		doc, err := ReadDocument(todoPath)
+		if err != nil {
+			t.Fatalf("task was not returned to todo/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "todo" {
+			t.Fatalf("status = %v, want todo", doc.FrontMatter["status"])
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Fatalf("resume_credit was not set on rejected park: %#v", doc.FrontMatter)
+		}
+		if !strings.Contains(doc.Body, "Park rejected") {
+			t.Fatalf("rejection rule not written in progress: %s", doc.Body)
+		}
+
+		// Next claim continues attempt 1
+		scanAndWait(t, manager)
+		working := filepath.Join(base, "working", name)
+		docAfter, _ := claimedAttempt(t, manager, working)
+		if got := numberValue(docAfter.FrontMatter["attempt"]); got != 1 {
+			t.Fatalf("attempt after rejected park = %d, want 1 (attempt not spent)", got)
+		}
+	}
+
+	// 2. Task implementation transition: past wake_at is rejected
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task implementation past wake_at rejected", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+			fm["waiting_for"] = "past wake_at"
+			fm["wake_at"] = time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+		})
+		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		todoPath := filepath.Join(base, "todo", name)
+		doc, err := ReadDocument(todoPath)
+		if err != nil {
+			t.Fatalf("task was not returned to todo/ on past wake_at: %v", err)
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Fatalf("resume_credit was not set on rejected past wake_at: %#v", doc.FrontMatter)
+		}
+	}
+
+	// 3. Task implementation transition: future wake_at IS accepted
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task implementation future wake_at accepted", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+			fm["waiting_for"] = "future wake_at"
+			fm["wake_at"] = time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+		})
+		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not accepted into waiting/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "waiting" {
+			t.Fatalf("status = %v, want waiting", doc.FrontMatter["status"])
+		}
+	}
+
+	// 4. Task implementation transition: joey_ask IS accepted
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task implementation joey_ask accepted", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		parkDuringTurn(t, fake, base, name, func(fm map[string]any) {
+			fm["waiting_for"] = "joey decision"
+			fm["joey_ask"] = map[string]any{"kind": "choice", "prompt": "Approve?"}
+		})
+		scanAndWait(t, manager)
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task with joey_ask was not accepted into waiting/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "waiting" {
+			t.Fatalf("status = %v, want waiting", doc.FrontMatter["status"])
+		}
+	}
+
+	// 5. Task review transition: prose-only waiting_for is rejected
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task review prose park rejected", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		fake.beforeEmit = func() {
+			working := filepath.Join(base, "working", name)
+			if _, err := os.Stat(working); err == nil {
+				// Turn 1: move to review
+				_ = moveDocument(working, filepath.Join(base, "review", name), "review", time.Now().UTC())
+				return
+			}
+			reviewing := filepath.Join(base, "reviewing", name)
+			if _, err := os.Stat(reviewing); err == nil {
+				// Turn 2: reviewer moves to waiting without routable path
+				editFrontMatter(t, reviewing, func(fm map[string]any) {
+					fm["waiting_for"] = "prose only in review"
+				})
+				_ = moveDocument(reviewing, filepath.Join(base, "waiting", name), "waiting", time.Now().UTC())
+			}
+		}
+		scanAndWait(t, manager) // claim implementation, move to review
+		scanAndWait(t, manager) // claim review, park without routable path
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		todoPath := filepath.Join(base, "todo", name)
+		doc, err := ReadDocument(todoPath)
+		if err != nil {
+			t.Fatalf("review park without routable path was not returned to todo/: %v", err)
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Fatalf("resume_credit was not set on review park rejection: %#v", doc.FrontMatter)
+		}
+		if !strings.Contains(doc.Body, "Park rejected") {
+			t.Fatalf("rejection rule not written in progress: %s", doc.Body)
+		}
+	}
+
+	// 6. Goal planning transition: prose-only waiting_for is rejected to proposed
+	{
+		cfg, _, manager := workflowTestManager(t)
+		route := workflowRoutes()[1] // goals
+		goal, err := Create(cfg, "goals", "goal planning prose park rejected", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(goal)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		planning := filepath.Join(base, "planning", name)
+		if _, err := ClaimDocument(goal, planning, "planning", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		waiting := filepath.Join(base, "waiting", name)
+		editFrontMatter(t, planning, func(fm map[string]any) {
+			fm["waiting_for"] = "prose only goal wait"
+		})
+		if err := moveDocument(planning, waiting, "waiting", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		lease := Lease{
+			ID: leaseID(route.Name+":"+phaseGoalPlanning, name), ClaimID: "planning",
+			DocumentType: "goal", OwnerID: manager.ownerID, Route: route.Name, File: planning,
+			SessionKey: "test:goal:planning", Phase: phaseGoalPlanning, ClaimAttempt: 1,
+			StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(), State: "processing",
+		}
+		_ = manager.saveLease(lease)
+
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		proposedPath := filepath.Join(base, "proposed", name)
+		doc, err := ReadDocument(proposedPath)
+		if err != nil {
+			t.Fatalf("goal was not returned to proposed/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "proposed" {
+			t.Fatalf("status = %v, want proposed", doc.FrontMatter["status"])
+		}
+		if !strings.Contains(doc.Body, "Park rejected") {
+			t.Fatalf("rejection rule not written in progress: %s", doc.Body)
+		}
+	}
+
+	// 7. Goal review transition: prose-only waiting_for is rejected to review
+	{
+		cfg, _, manager := workflowTestManager(t)
+		route := workflowRoutes()[1] // goals
+		goal, err := Create(cfg, "goals", "goal review prose park rejected", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(goal)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		reviewing := filepath.Join(base, "reviewing", name)
+		editFrontMatter(t, goal, func(fm map[string]any) {
+			fm["status"] = "review"
+		})
+		if _, err := ClaimDocument(goal, reviewing, "reviewing", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		waiting := filepath.Join(base, "waiting", name)
+		editFrontMatter(t, reviewing, func(fm map[string]any) {
+			fm["waiting_for"] = "prose only goal review wait"
+		})
+		if err := moveDocument(reviewing, waiting, "waiting", time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		lease := Lease{
+			ID: leaseID(route.Name+":"+phaseGoalReview, name), ClaimID: "review",
+			DocumentType: "goal", OwnerID: manager.ownerID, Route: route.Name, File: reviewing,
+			SessionKey: "test:goal:review", Phase: phaseGoalReview, ClaimAttempt: 1,
+			StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(), State: "processing",
+		}
+		_ = manager.saveLease(lease)
+
+		if err := manager.reconcileTransitions(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		reviewPath := filepath.Join(base, "review", name)
+		doc, err := ReadDocument(reviewPath)
+		if err != nil {
+			t.Fatalf("goal review was not returned to review/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "review" {
+			t.Fatalf("status = %v, want review", doc.FrontMatter["status"])
+		}
+		if !strings.Contains(doc.Body, "Park rejected") {
+			t.Fatalf("rejection rule not written in progress: %s", doc.Body)
+		}
+	}
+}
+
+func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
+	// Variant 1: reset time present in provider message
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 with reset time", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		editFrontMatter(t, task, func(fm map[string]any) {
+			fm["agent"] = "kimi"
+		})
+		fake.sendErrs = []error{errors.New("429 rate limit exceeded; resets at 2026-09-25T05:30:00Z")}
+
+		scanAndWait(t, manager)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		if doc.FrontMatter["status"] != "waiting" {
+			t.Fatalf("status = %v, want waiting", doc.FrontMatter["status"])
+		}
+		if doc.FrontMatter["quota_reset_at"] != "2026-09-25T05:30:00Z" {
+			t.Fatalf("quota_reset_at = %v, want 2026-09-25T05:30:00Z", doc.FrontMatter["quota_reset_at"])
+		}
+		if doc.FrontMatter["wake_at"] != "2026-09-25T05:30:00Z" {
+			t.Fatalf("wake_at = %v, want 2026-09-25T05:30:00Z", doc.FrontMatter["wake_at"])
+		}
+		if doc.FrontMatter["agent"] != "kimi" {
+			t.Fatalf("agent changed to %v, want kimi", doc.FrontMatter["agent"])
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Fatalf("resume_credit was not set: %#v", doc.FrontMatter)
+		}
+		if !strings.Contains(doc.Body, "quota wall on kimi; parked until 2026-09-25T05:30:00Z; attempt not spent") {
+			t.Fatalf("progress note missing: %s", doc.Body)
+		}
+
+		leases, _ := manager.loadLeases()
+		if len(leases) != 0 {
+			t.Fatalf("lease still exists: %#v", leases)
+		}
+
+		// When wake_at arrives, next claim continues attempt 1
+		editFrontMatter(t, waitingPath, func(fm map[string]any) {
+			fm["wake_at"] = time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+		})
+		scanAndWait(t, manager)
+		working := filepath.Join(base, "working", name)
+		claimedDoc, _ := claimedAttempt(t, manager, working)
+		if got := numberValue(claimedDoc.FrontMatter["attempt"]); got != 1 {
+			t.Fatalf("attempt after quota resume = %d, want 1", got)
+		}
+	}
+
+	// Variant 2: reset time from snapshot.json
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 with snapshot reset", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		editFrontMatter(t, task, func(fm map[string]any) {
+			fm["agent"] = "kimi"
+		})
+
+		snapDir := t.TempDir()
+		snapFile := filepath.Join(snapDir, "snapshot.json")
+		expectedReset := time.Now().Add(45 * time.Minute).UTC().Truncate(time.Second)
+		snapContent := fmt.Sprintf(`{"plans":{"kimi_coding":{"five_hour":{"pct":100,"resets_at":"%s"}}}}`, expectedReset.Format(time.RFC3339))
+		if err := os.WriteFile(snapFile, []byte(snapContent), 0644); err != nil {
+			t.Fatal(err)
+		}
+		origSnapshot := usageSnapshotPath
+		usageSnapshotPath = snapFile
+		defer func() { usageSnapshotPath = origSnapshot }()
+
+		fake.sendErrs = []error{errors.New("429 Too Many Requests")}
+		scanAndWait(t, manager)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		if doc.FrontMatter["quota_reset_at"] != expectedReset.Format(time.RFC3339) {
+			t.Fatalf("quota_reset_at = %v, want %s", doc.FrontMatter["quota_reset_at"], expectedReset.Format(time.RFC3339))
+		}
+	}
+
+	// Variant 3: no reset time in error, no snapshot -> now + 1h
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 fallback +1h", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+		editFrontMatter(t, task, func(fm map[string]any) {
+			fm["agent"] = "cursor" // no snapshot plan for cursor
+		})
+
+		origSnapshot := usageSnapshotPath
+		usageSnapshotPath = filepath.Join(t.TempDir(), "nonexistent.json")
+		defer func() { usageSnapshotPath = origSnapshot }()
+
+		before := time.Now().UTC().Add(1 * time.Hour)
+		fake.sendErrs = []error{errors.New("429 resource_exhausted: quota limit exceeded")}
+		scanAndWait(t, manager)
+		after := time.Now().UTC().Add(1 * time.Hour)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		resetStr, _ := doc.FrontMatter["quota_reset_at"].(string)
+		parsedReset, err := time.Parse(time.RFC3339, resetStr)
+		if err != nil {
+			t.Fatalf("unparseable quota_reset_at: %v", resetStr)
+		}
+		if parsedReset.Before(before.Add(-5*time.Second)) || parsedReset.After(after.Add(5*time.Second)) {
+			t.Fatalf("parsedReset = %v, want ~1h from now (%v..%v)", parsedReset, before, after)
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Fatalf("resume_credit was not set: %#v", doc.FrontMatter)
+		}
+	}
+}
+

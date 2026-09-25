@@ -35,7 +35,7 @@ func workflowRoutes() []workflowRoute {
 // one, and belongs to the ordinary stale path and its escalation.
 const (
 	awaitingTransitionStaleAfter      = 2 * time.Minute
-	quickAwaitingTransitionRecoveries = 3
+	quickAwaitingTransitionRecoveries = 1
 	// restartInterruptGrace is how long after a manager starts that a worker
 	// SIGTERM/SIGKILL is still treated as the restart that created this
 	// process, not as a dispatch failure of the task. Observed 2026-09-19:

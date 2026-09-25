@@ -559,6 +559,9 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 			reviewDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review")
 			path := filepath.Join(filepath.Dir(reviewDir), "reviewing", "review.md")
 			doc := Document{FrontMatter: map[string]any{"id": "review-id", "title": "review", "status": "reviewing", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339), "review_attempt": 1, "notify": map[string]any{"enabled": false}}, Body: "# review\n"}
+			if test.target == "waiting" {
+				doc.FrontMatter["joey_ask"] = map[string]any{"kind": "choice", "prompt": "Confirm in-game grade?"}
+			}
 			if err := WriteDocument(path, doc); err != nil {
 				t.Fatal(err)
 			}
@@ -989,7 +992,20 @@ func TestTransientProviderErrorRetriesInPlace(t *testing.T) {
 				t.Fatalf("harness calls = %d, want %d", fake.calls, test.wantCalls)
 			}
 			leases, err := manager.loadLeases()
-			if err != nil || len(leases) != 1 {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "quota refusal" {
+				if len(leases) != 0 {
+					t.Fatalf("quota refusal lease survived: %#v", leases)
+				}
+				entries, err := os.ReadDir(cfg.StatePath("tasks", "waiting"))
+				if err != nil || len(entries) != 1 {
+					t.Fatalf("expected 1 task in waiting/, got entries=%v, err=%v", entries, err)
+				}
+				return
+			}
+			if len(leases) != 1 {
 				t.Fatalf("leases = %#v, %v", leases, err)
 			}
 			current := leases[0]
