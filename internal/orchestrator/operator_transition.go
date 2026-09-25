@@ -66,6 +66,10 @@ func (m *Manager) completeUnclaimedTaskTransition(ctx context.Context, path, tas
 			ClaimAttempt: max(numberValue(document.FrontMatter["review_attempt"]), numberValue(document.FrontMatter["attempt"])),
 			File:         path,
 		}
-		m.startTaskNotificationAgent(ctx, source, status, path)
+		// The web control route invokes this on the HTTP request context,
+		// which is canceled the moment the control response returns; the
+		// async notification turn must outlive the request exactly as the
+		// claimed-settle path's long-lived loop context does.
+		m.startTaskNotificationAgent(context.WithoutCancel(ctx), source, status, path)
 	}
 }

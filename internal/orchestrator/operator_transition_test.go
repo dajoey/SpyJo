@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,6 +62,37 @@ func TestFinalizeOperatorTaskTransitionDoneRunsHooksAndNotificationDecision(t *t
 	}
 	if target.calls.Load() != 1 {
 		t.Fatalf("notification decision turns = %d, want 1", target.calls.Load())
+	}
+}
+
+// Recovery-live defect (2026-09-25, web Approve on a scratch task): the web
+// control route runs FinalizeOperatorTaskTransition on the HTTP request
+// context, which is canceled the moment the response returns. The async
+// notification turn inherited that cancellation and died at herdr spawn
+// ("context canceled", 92ms) — the claimed-settle path passes the
+// orchestrator's long-lived loop context and never hits this. The turn must
+// not observe the request's cancellation.
+func TestFinalizeOperatorTaskTransitionNotificationSurvivesCanceledRequestContext(t *testing.T) {
+	target := &notificationActionHarness{}
+	var observed atomic.Value // error observed by the harness turn
+	target.action = func(ctx context.Context, _ string) error {
+		if err := ctx.Err(); err != nil {
+			observed.Store(err.Error())
+		}
+		return ctx.Err()
+	}
+	manager, path := notificationTestManager(t, config.TaskNotificationsDecide, target)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	manager.FinalizeOperatorTaskTransition(reqCtx, path, "task-1", "t-web-1", "done")
+	cancel() // the HTTP request is gone the moment the control response returns
+	manager.Wait()
+
+	if target.calls.Load() != 1 {
+		t.Fatalf("notification decision turns = %d, want 1", target.calls.Load())
+	}
+	if s, _ := observed.Load().(string); s != "" {
+		t.Fatalf("notification turn observed cancellation from the dead request context: %s", s)
 	}
 }
 
