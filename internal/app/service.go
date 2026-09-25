@@ -1066,13 +1066,21 @@ func (s *Service) finishCancelledJobAfterGrace(job Job) {
 	if grace <= 0 {
 		grace = jobCancellationGrace
 	}
-	time.AfterFunc(grace, func() {
-		current, ok := s.Runtime.Job(job.ID)
-		if ok && current.StableID == job.StableID && current.Execution == JobCancelling {
-			s.stopJobChatActivity(job.ID)
-			s.Runtime.EndJob(job.ID)
+	deadline := time.Now().Add(grace)
+	go func() {
+		for {
+			time.Sleep(200 * time.Millisecond)
+			current, ok := s.Runtime.Job(job.ID)
+			if !ok || current.StableID != job.StableID || current.Execution != JobCancelling {
+				return
+			}
+			if !s.Harness.IsActive(job.SessionKey) || time.Now().After(deadline) {
+				s.stopJobChatActivity(job.ID)
+				s.Runtime.EndJob(job.ID)
+				return
+			}
 		}
-	})
+	}()
 }
 
 func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {

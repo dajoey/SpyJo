@@ -548,7 +548,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 	for _, test := range []struct {
 		name, target, want string
 		sameThread         bool
-	}{{"accept", "done", "done", false}, {"reject", "todo", "todo", false}, {"self-review", "done", "todo", true}, {"park accepted on human confirmation", "waiting", "waiting", false}, {"failed is not a review outcome", "failed", "todo", false}} {
+	}{{"accept", "done", "done", false}, {"reject", "todo", "todo", false}, {"self-review", "done", "todo", true}, {"park accepted on human confirmation", "waiting", "waiting", false}, {"failed is not a review outcome", "failed", "todo", false}, {"cancel during review honours operator cancel", "cancelled", "cancelled", false}} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			if err := workspace.Init(root, false); err != nil {
@@ -587,6 +587,82 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 				t.Fatal("terminal review retained lease")
 			}
 		})
+	}
+}
+
+func TestCancelTaskDuringReviewDoesNotSpendAttemptOrRedispatch(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	route := workflowRoutes()[0]
+	reviewDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review")
+	path := filepath.Join(filepath.Dir(reviewDir), "reviewing", "review.md")
+	doc := Document{FrontMatter: map[string]any{
+		"id":             "review-id",
+		"title":          "review",
+		"status":         "reviewing",
+		"created_at":     time.Now().UTC().Format(time.RFC3339),
+		"updated_at":     time.Now().UTC().Format(time.RFC3339),
+		"attempt":        1,
+		"review_attempt": 1,
+		"notify":         map[string]any{"enabled": false},
+	}, Body: "# review\n"}
+	if err := WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeRecipient()
+	manager := New(cfg, fake, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	lease := Lease{
+		ID: "lease", Route: "tasks", File: path, SessionKey: "review-session",
+		Phase: phaseTaskReview, ClaimAttempt: 1, ThreadID: "review-thread",
+		ImplementerThread: "implementation-thread", StartedAt: time.Now(), HeartbeatAt: time.Now(),
+	}
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+
+	// Operator moves the task from reviewing/ to cancelled/
+	cancelledTarget := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "cancelled", filepath.Base(path))
+	if err := os.Rename(path, cancelledTarget); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile transitions
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// It must stay in cancelled/, NOT be redirected to todo/
+	todoPath := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "todo", filepath.Base(path))
+	if _, err := os.Stat(todoPath); err == nil {
+		t.Fatal("task was incorrectly redirected to todo/ after operator cancel during review")
+	}
+	if _, err := os.Stat(cancelledTarget); err != nil {
+		t.Fatalf("task was not found in cancelled/: %v", err)
+	}
+
+	// Lease must be cleaned up
+	if manager.leaseExists(lease.ID) {
+		t.Fatal("cancelled review retained lease")
+	}
+
+	// Attempt must not be incremented
+	cancelledDoc, err := ReadDocument(cancelledTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if numberValue(cancelledDoc.FrontMatter["attempt"]) != 1 {
+		t.Fatalf("attempt was incremented to %v, want 1", cancelledDoc.FrontMatter["attempt"])
+	}
+
+	// ScanOnce must not re-dispatch or claim the cancelled task
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fake.calls != 0 {
+		t.Fatalf("cancelled task was re-dispatched: %d calls", fake.calls)
 	}
 }
 

@@ -2,10 +2,13 @@ package harness
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewHerdrDefaults(t *testing.T) {
@@ -300,5 +303,138 @@ func TestWorkerSubjectAndWorkspaceLabel(t *testing.T) {
 				t.Errorf("workerWorkspaceLabel(%q) = %q, want %q", gotSubject, gotLabel, tc.wantLabel)
 			}
 		})
+	}
+}
+
+func TestHerdrInterruptDeadlockAndPaneTeardown(t *testing.T) {
+	dir := t.TempDir()
+	eventsFile := filepath.Join(dir, "events.txt")
+	scriptPath := filepath.Join(dir, "fake-herdr")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+cmd="$1"
+sub="$2"
+shift 2
+
+case "$cmd" in
+workspace)
+	echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"[sj-worker] test"}]}}'
+	;;
+agent)
+	case "$sub" in
+	list)
+		echo '{"result":{"agents":[]}}'
+		;;
+	start)
+		echo '{"result":{}}'
+		;;
+	get)
+		echo '{"result":{"agent":{"agent":"opencode","agent_status":"working","agent_session":{"value":"ses-123"}}}}'
+		;;
+	rename)
+		echo "agent-cleared" >> %q
+		echo '{"result":{}}'
+		;;
+	send-keys)
+		echo "send-keys" >> %q
+		;;
+	prompt)
+		echo "prompt-started" >> %q
+		while true; do
+			sleep 0.1
+		done
+		;;
+	*)
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+tab)
+	case "$sub" in
+	create)
+		echo "tab-created" >> %q
+		echo '{"result":{"tab":{"tab_id":"tab-123"},"root_pane":{"pane_id":"pane-456"}}}'
+		;;
+	get)
+		if grep -q "tab-closed" %q 2>/dev/null; then
+			exit 1
+		fi
+		echo '{"result":{"tab":{"focused":false}}}'
+		;;
+	close)
+		echo "tab-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+pane)
+	case "$sub" in
+	close)
+		echo "pane-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+esac
+`, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHerdr(HarnessConfig{
+		Name:         "herdr",
+		Command:      scriptPath,
+		Cwd:          dir,
+		SessionsFile: filepath.Join(dir, "sessions.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := "orchestrator:tasks:task_implementation:test-task:1"
+	sendDone := make(chan error, 1)
+	go func() {
+		_, _, sendErr := h.Send(context.Background(), key, "run test", nil)
+		sendDone <- sendErr
+	}()
+
+	waitForEvent := func(eventName string, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(eventsFile)
+			if err == nil && strings.Contains(string(data), eventName) {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+
+	if !waitForEvent("prompt-started", 3*time.Second) {
+		t.Fatal("prompt did not start within timeout")
+	}
+
+	interruptDone := make(chan struct{})
+	var stopped bool
+	var interruptErr error
+	go func() {
+		stopped, interruptErr = h.Interrupt(context.Background(), key)
+		close(interruptDone)
+	}()
+
+	select {
+	case <-interruptDone:
+		if interruptErr != nil {
+			t.Fatalf("Interrupt returned error: %v", interruptErr)
+		}
+		if !stopped {
+			t.Fatal("Interrupt returned stopped = false")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Interrupt deadlocked while prompt was active (lockForKey deadlock)")
+	}
+
+	if !waitForEvent("tab-closed", 5*time.Second) {
+		t.Fatal("tab was not closed after interrupt: worker pane left open")
 	}
 }

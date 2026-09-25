@@ -1111,12 +1111,16 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 	// (e.g. an in-game grade of a testing build). Returning it to todo instead
 	// burns a full implementation turn and an attempt whose only act is to park
 	// it again (observed 2026-09-17 on an attempt-capped task).
-	if status != "done" && status != "todo" && status != "waiting" {
+	// An operator may cancel the task while under review; honour that decision.
+	if status != "done" && status != "todo" && status != "waiting" && status != "cancelled" {
 		var err error
 		status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Invalid task-review transition; review may accept into done, return findings to todo, or park an accepted attempt in waiting on a human confirmation.")
 		if err != nil {
 			return status, path, err
 		}
+	}
+	if status == "cancelled" && m.Harness.IsActive(lease.SessionKey) {
+		_, _ = m.Harness.Interrupt(ctx, lease.SessionKey)
 	}
 	if status != "waiting" {
 		m.finalizeTaskCompletionSummary(path, status)
@@ -1130,7 +1134,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route workflowRou
 		// stricter, so the implementer's pass-through continues the attempt.
 		m.grantParkCredit(path)
 	}
-	if status == "done" || status == "waiting" {
+	if status == "done" || status == "waiting" || status == "cancelled" {
 		if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 			return status, path, err
 		}

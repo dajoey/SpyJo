@@ -809,6 +809,10 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 
 	close(streamDone)
 
+	if turnContext.Err() != nil {
+		return threadID, false, turnContext.Err()
+	}
+
 	// Inspect final agent state
 	getCmd := exec.Command(h.config.Command, "agent", "get", target)
 	getOut, getErr := getCmd.Output()
@@ -1172,11 +1176,7 @@ func (h *Herdr) saveSessionsLocked() error {
 	return fsx.AtomicWriteFile(h.config.SessionsFile, data, 0600)
 }
 
-func (h *Herdr) Interrupt(_ context.Context, key string) (bool, error) {
-	lock := h.lockForKey(key)
-	lock.Lock()
-	defer lock.Unlock()
-
+func (h *Herdr) Interrupt(ctx context.Context, key string) (bool, error) {
 	h.mu.Lock()
 	turn := h.active[key]
 	h.mu.Unlock()
@@ -1186,7 +1186,8 @@ func (h *Herdr) Interrupt(_ context.Context, key string) (bool, error) {
 	}
 
 	turn.cancel()
-	_ = exec.Command(h.config.Command, "agent", "send-keys", turn.target, "ctrl+c").Run()
+	_ = exec.CommandContext(ctx, h.config.Command, "agent", "send-keys", turn.target, "ctrl+c").Run()
+	go h.teardownWorker(key, turn.tabID, turn.paneID, turn.target, true)
 	return true, nil
 }
 
@@ -1372,38 +1373,44 @@ func (h *Herdr) isTabFocused(tabID string) bool {
 // this key's send lock is free and no turn is active; otherwise the newer turn
 // owns the worker and runs its own cleanup when it ends.
 func (h *Herdr) cleanupCompletedTab(key, tabID, paneID, agentName string) {
+	h.teardownWorker(key, tabID, paneID, agentName, false)
+}
+
+func (h *Herdr) teardownWorker(key, tabID, paneID, agentName string, force bool) {
 	if tabID == "" && paneID == "" {
 		return
 	}
 
-	// Brief initial settle pause before checking focus or closing
-	time.Sleep(1500 * time.Millisecond)
+	if !force {
+		// Brief initial settle pause before checking focus or closing
+		time.Sleep(1500 * time.Millisecond)
 
-	if tabID != "" {
-		deadline := time.Now().Add(5 * time.Minute)
-		for time.Now().Before(deadline) {
-			h.mu.Lock()
-			closed := h.closed
-			h.mu.Unlock()
-			if closed {
-				return
-			}
+		if tabID != "" {
+			deadline := time.Now().Add(5 * time.Minute)
+			for time.Now().Before(deadline) {
+				h.mu.Lock()
+				closed := h.closed
+				h.mu.Unlock()
+				if closed {
+					return
+				}
 
-			// A newer turn already claimed this worker: it owns the tab.
-			if h.IsActive(key) {
-				return
-			}
+				// A newer turn already claimed this worker: it owns the tab.
+				if h.IsActive(key) {
+					return
+				}
 
-			// If tab was already closed or removed, nothing more to do
-			if !h.tabExists(tabID) {
-				return
-			}
+				// If tab was already closed or removed, nothing more to do
+				if !h.tabExists(tabID) {
+					return
+				}
 
-			// If tab is no longer focused, break and proceed to close
-			if !h.isTabFocused(tabID) {
-				break
+				// If tab is no longer focused, break and proceed to close
+				if !h.isTabFocused(tabID) {
+					break
+				}
+				time.Sleep(1500 * time.Millisecond)
 			}
-			time.Sleep(1500 * time.Millisecond)
 		}
 	}
 
@@ -1411,7 +1418,16 @@ func (h *Herdr) cleanupCompletedTab(key, tabID, paneID, agentName string) {
 	// target right now cannot adopt the tab while it is being torn down. A lock
 	// already held means a newer turn is running on this worker: leave it alone.
 	lock := h.lockForKey(key)
-	if !lock.TryLock() {
+	deadline := time.Now().Add(5 * time.Second)
+	acquired := false
+	for time.Now().Before(deadline) {
+		if lock.TryLock() {
+			acquired = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !acquired {
 		return
 	}
 	defer lock.Unlock()
