@@ -9,6 +9,7 @@ import (
 	"github.com/agent0ai/spynel/internal/agentdocs"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -91,5 +92,48 @@ func TestEveryOrchestrationPhaseGetsOneCallableDocsGuidance(t *testing.T) {
 				t.Fatalf("prompt lost explicit user/safety precedence or the workspace override: stock=%q custom=%q", stock, overridden)
 			}
 		})
+	}
+}
+
+func TestRecoveryPromptInjectsWorkerName(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, nil, extensions.Runner{})
+	route := workflowRoutes()[0]
+	file := filepath.Join(root, ".spynel", "tasks", "working", "tasks-20260926-herdr-idle-must-be-stable-before-tab-close.md")
+	lease := Lease{
+		File:         file,
+		Route:        "tasks",
+		Phase:        phaseTaskImplementation,
+		ClaimAttempt: 1,
+		SessionKey:   "orchestrator:tasks:task_implementation:tasks-20260926-herdr-idle-must-be-stable-before-tab-close:1",
+	}
+
+	prompt, err := manager.renderPrompt(route, lease, route.RecoveryPrompt)
+	if err != nil {
+		t.Fatalf("render prompt failed: %v", err)
+	}
+
+	expectedWorker := harness.WorkerNameForKey(lease.SessionKey)
+	if expectedWorker == "" {
+		t.Fatalf("expectedWorker is empty")
+	}
+	if strings.Contains(prompt, "{{WORKER_NAME}}") {
+		t.Fatalf("prompt still contains raw {{WORKER_NAME}} placeholder")
+	}
+	if !strings.Contains(prompt, expectedWorker) {
+		t.Fatalf("prompt does not contain expected worker name %q:\n%s", expectedWorker, prompt)
+	}
+	if !strings.Contains(prompt, "herdr agent get "+expectedWorker) {
+		t.Fatalf("prompt does not contain herdr agent get command for worker name %q", expectedWorker)
+	}
+	if !strings.Contains(prompt, "belongs to another task") {
+		t.Fatalf("prompt does not contain guidance warning about other processes belonging to another task")
 	}
 }

@@ -35,6 +35,9 @@ type Herdr struct {
 	sessions map[string]string
 	active   map[string]*herdrTurn
 	closed   bool
+
+	idleStabilityCount    int
+	idleStabilityInterval time.Duration
 }
 
 type herdrTurn struct {
@@ -112,13 +115,22 @@ func NewHerdr(cfg HarnessConfig) (*Herdr, error) {
 		cfg.Cwd = "."
 	}
 	h := &Herdr{
-		config:   cfg,
-		keyLocks: map[string]*sync.Mutex{},
-		sessions: map[string]string{},
-		active:   map[string]*herdrTurn{},
+		config:                cfg,
+		keyLocks:              map[string]*sync.Mutex{},
+		sessions:              map[string]string{},
+		active:                map[string]*herdrTurn{},
+		idleStabilityCount:    3,
+		idleStabilityInterval: 2 * time.Second,
 	}
 	_ = h.loadSessions()
 	return h, nil
+}
+
+// SetIdleStability configures the number of consecutive idle readings required
+// and the interval between checks before considering a worker turn complete.
+func (h *Herdr) SetIdleStability(count int, interval time.Duration) {
+	h.idleStabilityCount = count
+	h.idleStabilityInterval = interval
 }
 
 func (h *Herdr) Start(ctx context.Context) error {
@@ -422,6 +434,12 @@ func fitHerdrWorkerName(prefix, body, hashSource string) string {
 		result = result[:maxLen]
 	}
 	return strings.Trim(result, "-_")
+}
+
+// WorkerNameForKey returns the deterministic Herdr worker agent name for a session key.
+func WorkerNameForKey(key string) string {
+	name, _ := workerNameAndLabel(key, "")
+	return name
 }
 
 func workerNameAndLabel(key, model string) (workerName string, tabLabel string) {
@@ -793,18 +811,80 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	// working. Treating that as a failure closed the worker tab mid-task and sent
 	// a recovery agent to redo the work (8 times 2026-09-15..17, spyjo-observer).
 	// Keep waiting while herdr still reports the agent working, up to a ceiling.
+	runner := func(ctx context.Context, args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, h.config.Command, args...)
+		turn.cmd = cmd
+		return cmd.CombinedOutput()
+	}
+	status := func(text string) {
+		if emit != nil {
+			emit(core.Event{Kind: core.EventStatus, Text: text})
+		}
+	}
+
 	if promptErr != nil && isHerdrWaitTimeout(string(promptOut)) {
-		promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling,
-			func(ctx context.Context, args ...string) ([]byte, error) {
-				cmd := exec.CommandContext(ctx, h.config.Command, args...)
-				turn.cmd = cmd
-				return cmd.CombinedOutput()
-			},
-			func(text string) {
-				if emit != nil {
-					emit(core.Event{Kind: core.EventStatus, Text: text})
+		promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling, runner, status)
+	}
+
+	// Idle stability check: herdr screen detection can momentarily classify an
+	// in-flight agent frame as idle mid-turn. If prompt --wait (or wait extension)
+	// exited ok, verify that the idle reading is stable by checking agent status
+	// repeatedly over a short window before closing the tab. If any check reports
+	// working, re-enter extendHerdrWait to keep waiting.
+	if promptErr == nil {
+		stabilityCount := h.idleStabilityCount
+		if stabilityCount <= 0 {
+			stabilityCount = 3
+		}
+		interval := h.idleStabilityInterval
+		if interval <= 0 && h.idleStabilityCount == 0 {
+			interval = 2 * time.Second
+		}
+		consecutiveIdle := 0
+		for consecutiveIdle < stabilityCount {
+			if turnContext.Err() != nil {
+				promptErr = turnContext.Err()
+				break
+			}
+			getOut, getErr := runner(turnContext, "agent", "get", target)
+			if getErr != nil {
+				break
+			}
+			var getResp herdrAgentGetResponse
+			if json.Unmarshal(getOut, &getResp) != nil {
+				break
+			}
+			agentSt := getResp.Result.Agent.AgentStatus
+			switch agentSt {
+			case "idle", "done":
+				consecutiveIdle++
+				if consecutiveIdle < stabilityCount && interval > 0 {
+					select {
+					case <-turnContext.Done():
+						promptErr = turnContext.Err()
+					case <-time.After(interval):
+					}
+					if promptErr != nil {
+						break
+					}
 				}
-			})
+			case "working":
+				consecutiveIdle = 0
+				promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, errors.New("agent still working"), herdrWaitCeiling, runner, status)
+				if promptErr != nil {
+					break
+				}
+			case "blocked":
+				consecutiveIdle = 0
+				promptErr = errors.New("agent_blocked")
+				break
+			default:
+				break
+			}
+			if promptErr != nil {
+				break
+			}
+		}
 	}
 
 	close(streamDone)

@@ -1857,6 +1857,22 @@ func (m *Manager) renderPrompt(route workflowRoute, lease Lease, promptPath stri
 	for _, status := range route.AllowedNext {
 		statuses = append(statuses, fmt.Sprintf("- %s: %s", status, filepath.Join(base, status)))
 	}
+	workerName := harness.WorkerNameForKey(lease.SessionKey)
+	if workerName == "" {
+		docID := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file))
+		if doc, err := ReadDocument(file); err == nil && documentID(doc) != "" {
+			docID = documentID(doc)
+		}
+		attempt := lease.ClaimAttempt
+		if attempt < 1 {
+			attempt = 1
+		}
+		phase := lease.Phase
+		if phase == "" {
+			phase = phaseForFile(route.Name, file)
+		}
+		workerName = harness.WorkerNameForKey(phaseSessionKey(route.Name, docID, phase, attempt))
+	}
 	replacements := map[string]string{
 		"{{FILE}}": file, "{{ROUTE}}": route.Name,
 		"{{ALLOWED_NEXT}}":   strings.Join(route.AllowedNext, ", "),
@@ -1866,6 +1882,8 @@ func (m *Manager) renderPrompt(route workflowRoute, lease Lease, promptPath stri
 		"{{RELATED_TASKS}}":  m.relatedTasksForGoal(file),
 		"{{TASK_SOURCE}}":    m.Config.StatePath("tasks", "todo"),
 		"{{GOAL_SOURCE}}":    m.Config.StatePath("goals", "proposed"),
+		"{{WORKER_NAME}}":    workerName,
+		"{{WORKER_PANE}}":    workerName,
 	}
 	prompt := string(data)
 	prompt = agentdocs.InjectPromptGuidance(prompt)

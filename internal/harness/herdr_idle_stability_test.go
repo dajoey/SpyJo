@@ -1,0 +1,246 @@
+package harness
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestHerdrIdleMustBeStableBeforeTabClose(t *testing.T) {
+	dir := t.TempDir()
+	eventsFile := filepath.Join(dir, "events.txt")
+	scriptPath := filepath.Join(dir, "fake-herdr")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+cmd="$1"
+sub="$2"
+shift 2
+
+case "$cmd" in
+workspace)
+	echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"[sj-worker] test"}]}}'
+	;;
+agent)
+	case "$sub" in
+	list)
+		echo '{"result":{"agents":[]}}'
+		;;
+	start)
+		echo '{"result":{}}'
+		;;
+	get)
+		if grep -q "agent-waited" %q 2>/dev/null; then
+			echo '{"result":{"agent":{"agent":"hermes","agent_status":"idle","agent_session":{"value":"ses-123"}}}}'
+		else
+			echo '{"result":{"agent":{"agent":"hermes","agent_status":"working","agent_session":{"value":"ses-123"}}}}'
+		fi
+		;;
+	wait)
+		echo "agent-waited" >> %q
+		echo '{"result":{}}'
+		;;
+	rename)
+		echo '{"result":{}}'
+		;;
+	prompt)
+		echo "prompt-finished" >> %q
+		echo '{"result":{}}'
+		;;
+	read)
+		echo 'Done with work.'
+		;;
+	*)
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+tab)
+	case "$sub" in
+	create)
+		echo "tab-created" >> %q
+		echo '{"result":{"tab":{"tab_id":"tab-123"},"root_pane":{"pane_id":"pane-456"}}}'
+		;;
+	get)
+		echo '{"result":{"tab":{"focused":false}}}'
+		;;
+	close)
+		echo "tab-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+pane)
+	case "$sub" in
+	close)
+		echo "pane-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+esac
+`, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHerdr(HarnessConfig{
+		Name:         "herdr",
+		Command:      scriptPath,
+		Cwd:          dir,
+		SessionsFile: filepath.Join(dir, "sessions.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetIdleStability(3, 10*time.Millisecond)
+
+	key := "orchestrator:tasks:task_implementation:test-task:1"
+	_, _, sendErr := h.Send(context.Background(), key, "run test", nil)
+	if sendErr != nil {
+		t.Fatalf("h.Send failed: %v", sendErr)
+	}
+
+	waitForEvent := func(eventName string, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(eventsFile)
+			if err == nil && strings.Contains(string(data), eventName) {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+
+	if !waitForEvent("agent-waited", 3*time.Second) {
+		data, _ := os.ReadFile(eventsFile)
+		t.Fatalf("harness closed tab or finished without waiting for working agent to reach stable idle; events:\n%s", string(data))
+	}
+	if !waitForEvent("tab-closed", 3*time.Second) {
+		data, _ := os.ReadFile(eventsFile)
+		t.Fatalf("tab was not closed after agent finished; events:\n%s", string(data))
+	}
+	data, err := os.ReadFile(eventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := string(data)
+	waitedIdx := strings.Index(events, "agent-waited")
+	closedIdx := strings.Index(events, "tab-closed")
+	if closedIdx != -1 && closedIdx < waitedIdx {
+		t.Fatalf("tab was closed before agent finished waiting; events:\n%s", events)
+	}
+}
+
+func TestHerdrGenuinelyIdleTurnCloses(t *testing.T) {
+	dir := t.TempDir()
+	eventsFile := filepath.Join(dir, "events.txt")
+	scriptPath := filepath.Join(dir, "fake-herdr")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+cmd="$1"
+sub="$2"
+shift 2
+
+case "$cmd" in
+workspace)
+	echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"[sj-worker] test"}]}}'
+	;;
+agent)
+	case "$sub" in
+	list)
+		echo '{"result":{"agents":[]}}'
+		;;
+	start)
+		echo '{"result":{}}'
+		;;
+	get)
+		echo '{"result":{"agent":{"agent":"hermes","agent_status":"idle","agent_session":{"value":"ses-123"}}}}'
+		;;
+	rename)
+		echo '{"result":{}}'
+		;;
+	prompt)
+		echo "prompt-finished" >> %q
+		echo '{"result":{}}'
+		;;
+	read)
+		echo 'Done with work.'
+		;;
+	*)
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+tab)
+	case "$sub" in
+	create)
+		echo "tab-created" >> %q
+		echo '{"result":{"tab":{"tab_id":"tab-123"},"root_pane":{"pane_id":"pane-456"}}}'
+		;;
+	get)
+		echo '{"result":{"tab":{"focused":false}}}'
+		;;
+	close)
+		echo "tab-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+pane)
+	case "$sub" in
+	close)
+		echo "pane-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+esac
+`, eventsFile, eventsFile, eventsFile, eventsFile)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHerdr(HarnessConfig{
+		Name:         "herdr",
+		Command:      scriptPath,
+		Cwd:          dir,
+		SessionsFile: filepath.Join(dir, "sessions.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetIdleStability(3, 10*time.Millisecond)
+
+	key := "orchestrator:tasks:task_implementation:test-task-idle:1"
+	start := time.Now()
+	_, _, sendErr := h.Send(context.Background(), key, "run test", nil)
+	if sendErr != nil {
+		t.Fatalf("h.Send failed: %v", sendErr)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 3*time.Second {
+		t.Fatalf("genuinely idle turn took %v, expected fast completion", elapsed)
+	}
+
+	waitForEvent := func(eventName string, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(eventsFile)
+			if err == nil && strings.Contains(string(data), eventName) {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+
+	if !waitForEvent("tab-closed", 3*time.Second) {
+		data, _ := os.ReadFile(eventsFile)
+		t.Fatalf("tab was not closed after genuinely idle turn; events:\n%s", string(data))
+	}
+}
