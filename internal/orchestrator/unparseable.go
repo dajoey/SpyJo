@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -67,6 +68,10 @@ func unparseableRepairID(path string) string {
 // existing path. The corrupt document itself is never rewritten here.
 func (m *Manager) reportUnparseableDocument(path string, parseErr error) {
 	if parseErr == nil || path == "" {
+		return
+	}
+	if errors.Is(parseErr, fs.ErrNotExist) {
+		m.log("skipping vanished document " + path + ": " + parseErr.Error())
 		return
 	}
 	message := "unparseable durable document " + path + ": " + parseErr.Error()

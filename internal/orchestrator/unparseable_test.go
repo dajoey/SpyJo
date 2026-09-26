@@ -387,3 +387,46 @@ func TestScanOnceClaimsAlongsideUnparseableActiveGoal(t *testing.T) {
 		t.Fatalf("error records = %#v, want one", errorRecords)
 	}
 }
+
+// A vanished document (e.g. deleted or moved between listing and reading, ENOENT)
+// must not file a repair task and must log a skip message instead.
+func TestReportUnparseableDocumentSkipsVanishedDocument(t *testing.T) {
+	root, cfg := newScratchWorkspace(t)
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
+
+	var logLines []string
+	manager.Log = func(line string) {
+		logLines = append(logLines, line)
+	}
+	var errorRecords []string
+	manager.LogError = func(component, event, message string) {
+		errorRecords = append(errorRecords, component+"|"+event+"|"+message)
+	}
+
+	vanishedPath := cfg.StatePath("tasks", "todo", "tasks-scratch-vanished.md")
+	_, readErr := os.ReadFile(vanishedPath)
+	if readErr == nil {
+		t.Fatal("expected ENOENT for non-existent file")
+	}
+
+	manager.reportUnparseableDocument(vanishedPath, readErr)
+
+	repairs := liveRepairTasks(t, cfg)
+	if len(repairs) != 0 {
+		t.Fatalf("repair task was filed for vanished document: %v", keysOf(repairs))
+	}
+	if len(errorRecords) != 0 {
+		t.Fatalf("unexpected error records: %v", errorRecords)
+	}
+
+	foundSkipLog := false
+	for _, line := range logLines {
+		if strings.Contains(line, "skipping vanished document") && strings.Contains(line, "tasks-scratch-vanished.md") {
+			foundSkipLog = true
+			break
+		}
+	}
+	if !foundSkipLog {
+		t.Fatalf("no log line recorded skip; log lines: %v", logLines)
+	}
+}
