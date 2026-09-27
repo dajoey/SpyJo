@@ -957,6 +957,8 @@ func TestTransientProviderErrorRetriesInPlace(t *testing.T) {
 		// The harness emits its own terminal error beside the refusal, exactly
 		// as herdr does, and that must not veto the retry.
 		"transient then success": {errs: []error{transient}, wantCalls: 2, wantState: "awaiting_transition", wantError: ""},
+		// An undelivered prompt is retried once in place on the same worker
+		"prompt_not_delivered then success": {errs: []error{errors.New("prompt_not_delivered: worker sj-t-a1-test never received prompt, please retry")}, wantCalls: 2, wantState: "awaiting_transition", wantError: ""},
 		// A turn that produced its final response and then failed on the way
 		// back has already done its work: reconciliation owns it, not a retry.
 		"transient after a completed turn": {errs: []error{transient}, final: true, wantCalls: 1, wantState: "error", wantError: transient.Error()},

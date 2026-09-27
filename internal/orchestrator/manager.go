@@ -870,11 +870,19 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			if !eligible {
 				break
 			}
-			m.log(fmt.Sprintf("transient provider refusal on %s, retrying once in place: %v", lease.File, err))
+			retryText := "The provider refused this turn as busy; retrying once on the same worker."
+			retryDetail := "transient provider refusal: retrying once in place"
+			if strings.Contains(strings.ToLower(err.Error()), "prompt_not_delivered") {
+				m.log(fmt.Sprintf("prompt_not_delivered on %s, retrying once in place: %v", lease.File, err))
+				retryText = "Prompt was not delivered to worker; retrying once in place."
+				retryDetail = "prompt_not_delivered: retrying once in place"
+			} else {
+				m.log(fmt.Sprintf("transient provider refusal on %s, retrying once in place: %v", lease.File, err))
+			}
 			emit(core.Event{
 				Kind:      core.EventStatus,
-				Text:      "The provider refused this turn as busy; retrying once on the same worker.",
-				Execution: &core.ExecutionStatus{State: "running", Detail: "transient provider refusal: retrying once in place"},
+				Text:      retryText,
+				Execution: &core.ExecutionStatus{State: "running", Detail: retryDetail},
 			})
 		}
 		lifecycleMu.Lock()
@@ -2370,7 +2378,7 @@ func transientProviderError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "please retry") || strings.Contains(msg, "overloaded")
+	return strings.Contains(msg, "please retry") || strings.Contains(msg, "overloaded") || strings.Contains(msg, "prompt_not_delivered")
 }
 
 // restoreLeaseForRetry returns a lease parked by a refused attempt's terminal
