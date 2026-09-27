@@ -1,0 +1,68 @@
+dajoey@jobunthree:~/aibs/spyjo$ hermes --model opencode-go/glm-5.3-flash
+
+██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗
+██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝
+███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗█████╗███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║
+██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║╚════╝██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║
+██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║      ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝      ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝
+
+╭───── Hermes Agent v0.21.5+3738.gf0004c9 (2026.9.24) · upstream 6f7a7991 · local f0004c95 (+40 carried commits) ──────╮
+│                                   Available Tools                                                                    │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   browser: browser_back, browser_click, ...                                          │
+│  ⠀⠀⠀⠀⠀⠀⢀⣠⣴⣾⣿⣿⣇⠸⣿⣿⠇⣸⣿⣿⣷⣦⣄⡀⠀⠀⠀⠀⠀⠀   clarify: clarify                                                                   │
+│  ⠀⢀⣠⣴⣶⠿⠋⣩⡿⣿⡿⠻⣿⡇⢠⡄⢸⣿⠟⢿⣿⢿⣍⠙⠿⣶⣦⣄⡀⠀   code_execution: execute_code                                                       │
+│  ⠀⠀⠉⠉⠁⠶⠟⠋⠀⠉⠀⢀⣈⣁⡈⢁⣈⣁⡀⠀⠉⠀⠙⠻⠶⠈⠉⠉⠀⠀   connections: manage_connections                                                    │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⡿⠛⢁⡈⠛⢿⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   file: patch, read_file, search_files, write_file                                   │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠿⣿⣦⣤⣈⠁⢠⣴⣿⠿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   kanban: kanban_attach, kanban_attach_url, ...                                      │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠻⢿⣿⣦⡉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   memory: memory                                                                     │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢷⣦⣈⠛⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   other: tool_call, tool_describe, tool_search                                       │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣴⠦⠈⠙⠿⣦⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   (and 4 more toolsets...)                                                           │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣤⡈⠁⢤⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                                                                                      │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⠷⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   MCP Servers                                                                        │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠑⢶⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   alltrails (http) — configured                                                      │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠁⢰⡆⠈⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   graphiti (sse) — configured                                                        │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⠈⣡⠞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   rag (sse) — configured                                                             │
+│  ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀   spark (http) — configured                                                          │
+│                                   venice (http) — configured                                                         │
+│  glm-5.3-flash · Nous Research    venice-vision (stdio) — configured                                                 │
+│  /home/dajoey/aibs/spyjo          web-reader (http) — configured                                                     │
+│  Session: 20260927_164436_910347  web-search-prime (http) — configured                                               │
+│                                   work-rag (sse) — configured                                                        │
+│                                   zai-vision (stdio) — configured                                                    │
+│                                   zread (http) — configured                                                          │
+│                                                                                                                      │
+│                                   Available Skills                                                                   │
+│                                   autonomous-ai-agents: antigravity-cli, claude-code, +7 more                        │
+│                                   creative: ascii-art, ascii-video, +15 more                                         │
+│                                   data-science: jupyter-live-kernel                                                  │
+│                                   devops: agent-incident-forensics, botlab-ops, +39 more                             │
+│                                   domain: activity-wall-ops, agent-zero-ops, +28 more                                │
+│                                   email: email-inbox-triage                                                          │
+│                                   fleet: finding-triage, hermes-self, incidental-findings                            │
+│                                   gaming: minecraft-modpack-server, pokemon-player                                   │
+│                                   general: Skill Factory, dogfood, drawio-skill, +4 more                             │
+│                                   github: external-submissions, github, github-auth, +5 more                         │
+│                                   mcp: native-mcp                                                                    │
+│                                   media: spotify, youtube-content                                                    │
+│                                   mlops: audiocraft-audio-generation, dspy, +6 more                                  │
+│                                   note-taking: obsidian                                                              │
+│                                   productivity: box, document-to-action-items, docx, +13 more                        │
+│                                   red-teaming: godmode                                                               │
+│                                   research: blogwatcher, competitor-news-monitor, +5 more                            │
+│                                   smart-home: homey-control                                                          │
+│                                   social-media: reddit-reading, xurl                                                 │
+│                                   software-development: debugging-hermes-tui-commands, +15 more                      │
+│                                   venice: venice-api-keys, venice-api-overview, +18 more                             │
+│                                   web: authenticated-browser-automation, blocked-page-recovery                       │
+│                                                                                                                      │
+│                                   46 tools · 196 skills · /help for commands                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Welcome to Hermes Agent! Type your message or /help for commands.
+✦ Tip: context.engine in config.yaml can be set to a plugin name for alternative context management strategies.
+
+ ☤ glm-5.3-flash │ ctx -- │ [░░░░░░░░░░] -- │ 2s │ ⏲ 0s
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Plan a feature, then build it step by step
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

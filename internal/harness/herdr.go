@@ -1067,10 +1067,11 @@ var (
 		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
 	}
 	herdrThoughtPattern = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
-	hermesBoxPattern    = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
-	hermesReasoningBox  = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
-	kimiInputBoxPattern = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
-	agyInputBoxPattern  = regexp.MustCompile(`(?s)(?:╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯|─{5,}\s*\n[ \t]*>[^\n]*\n[ \t]*─{5,}(?:\s*\n[^\n]*\? for shortcuts[^\n]*)?)`)
+	hermesBoxPattern      = regexp.MustCompile(`(?s)╭─\s*[⚕☤]\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
+	hermesReasoningBox    = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
+	kimiInputBoxPattern   = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
+	agyInputBoxPattern    = regexp.MustCompile(`(?s)(?:╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯|─{5,}\s*\n[ \t]*>[^\n]*\n[ \t]*─{5,}(?:\s*\n[^\n]*\? for shortcuts[^\n]*)?)`)
+	hermesComposerPattern = regexp.MustCompile(`(?s)(?:─{5,}\s*\n[ \t]*(?:[\w.-]+[ \t]+)?❯.*?\n[ \t]*─{5,}|[⚕☤]\s+\S+\s+│[^\n]*\n[ \t]*─{5,}\s*\n.*?\n[ \t]*─{5,})`)
 )
 
 // cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
@@ -1089,6 +1090,9 @@ func cleanHerdrTerminalOutput(text string) string {
 
 	// Strip Antigravity / SpyJo bottom input box if present
 	text = agyInputBoxPattern.ReplaceAllString(text, "")
+
+	// Strip Hermes bottom composer if present
+	text = hermesComposerPattern.ReplaceAllString(text, "")
 
 	lines := strings.Split(text, "\n")
 	var cleanedLines []string
@@ -1209,7 +1213,10 @@ func isRunnerComposerVisible(model, screen string) bool {
 		}
 		return false
 	case strings.Contains(model, "hermes"):
-		if hermesBoxPattern.MatchString(screen) || strings.Contains(screen, "Type your message or /help") {
+		if strings.Contains(screen, "msg=interrupt") || strings.Contains(screen, "☤ ❯") {
+			return false
+		}
+		if hermesComposerPattern.MatchString(screen) || hermesBoxPattern.MatchString(screen) {
 			return true
 		}
 		return false
@@ -1224,13 +1231,13 @@ func isRunnerComposerVisible(model, screen string) bool {
 		}
 		return false
 	default:
-		if agyInputBoxPattern.MatchString(screen) || kimiInputBoxPattern.MatchString(screen) || hermesBoxPattern.MatchString(screen) {
+		if agyInputBoxPattern.MatchString(screen) || kimiInputBoxPattern.MatchString(screen) || hermesComposerPattern.MatchString(screen) || hermesBoxPattern.MatchString(screen) {
 			return true
 		}
 		if strings.Contains(screen, "? for shortcuts") && !strings.Contains(screen, "esc to cancel") {
 			return true
 		}
-		if strings.Contains(screen, "ctrl+p commands") || strings.Contains(screen, "Type your message") {
+		if strings.Contains(screen, "ctrl+p commands") {
 			return true
 		}
 		return false
@@ -1269,7 +1276,7 @@ func (h *Herdr) waitForRunnerComposer(ctx context.Context, target, model string,
 			}
 		}
 
-		if sessionID != "" && !strings.Contains(strings.ToLower(model), "agy") && !strings.Contains(strings.ToLower(model), "antigravity") {
+		if sessionID != "" && !strings.Contains(strings.ToLower(model), "agy") && !strings.Contains(strings.ToLower(model), "antigravity") && !strings.Contains(strings.ToLower(model), "hermes") {
 			return sessionID
 		}
 
