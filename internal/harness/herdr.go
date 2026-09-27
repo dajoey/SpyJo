@@ -879,7 +879,16 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 				promptErr = errors.New("agent_blocked")
 				break
 			default:
-				break
+				// Unknown status (a future herdr value): neither evidence of idle
+				// nor of work. Do not count it and do not busy-loop; wait one
+				// interval before re-reading (reviewer hardening note 2026-09-27).
+				if interval > 0 {
+					select {
+					case <-turnContext.Done():
+						promptErr = turnContext.Err()
+					case <-time.After(interval):
+					}
+				}
 			}
 			if promptErr != nil {
 				break

@@ -244,3 +244,114 @@ esac
 		t.Fatalf("tab was not closed after genuinely idle turn; events:\n%s", string(data))
 	}
 }
+
+// TestHerdrUnknownStatusDoesNotBusyLoop: an agent_status value the harness does
+// not know (a future herdr value) must neither count as idle nor spin
+// `agent get` in a tight loop while the turn context is alive. Reviewer note
+// 2026-09-27: pre-fix, the default switch arm re-exec'd herdr with no sleep.
+func TestHerdrUnknownStatusDoesNotBusyLoop(t *testing.T) {
+	dir := t.TempDir()
+	eventsFile := filepath.Join(dir, "events.txt")
+	scriptPath := filepath.Join(dir, "fake-herdr")
+	scriptContent := fmt.Sprintf(`#!/usr/bin/env bash
+cmd="$1"
+sub="$2"
+shift 2
+
+case "$cmd" in
+workspace)
+	echo '{"result":{"workspaces":[{"workspace_id":"w1","label":"[sj-worker] test"}]}}'
+	;;
+agent)
+	case "$sub" in
+	list)
+		echo '{"result":{"agents":[]}}'
+		;;
+	start)
+		echo '{"result":{}}'
+		;;
+	get)
+		echo "agent-get" >> %q
+		echo '{"result":{"agent":{"agent":"hermes","agent_status":"thinking","agent_session":{"value":"ses-123"}}}}'
+		;;
+	wait)
+		echo "agent-waited" >> %q
+		echo '{"result":{}}'
+		;;
+	rename)
+		echo '{"result":{}}'
+		;;
+	prompt)
+		echo "prompt-finished" >> %q
+		echo '{"result":{}}'
+		;;
+	read)
+		echo 'Done with work.'
+		;;
+	*)
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+tab)
+	case "$sub" in
+	create)
+		echo "tab-created" >> %q
+		echo '{"result":{"tab":{"tab_id":"tab-123"},"root_pane":{"pane_id":"pane-456"}}}'
+		;;
+	get)
+		echo '{"result":{"tab":{"focused":false}}}'
+		;;
+	close)
+		echo "tab-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+pane)
+	case "$sub" in
+	close)
+		echo "pane-closed" >> %q
+		echo '{"result":{}}'
+		;;
+	esac
+	;;
+esac
+`, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile, eventsFile)
+
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := NewHerdr(HarnessConfig{
+		Name:         "herdr",
+		Command:      scriptPath,
+		Cwd:          dir,
+		SessionsFile: filepath.Join(dir, "sessions.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.SetIdleStability(3, 100*time.Millisecond)
+
+	key := "orchestrator:tasks:task_implementation:test-task-unknown:1"
+	// resolveTarget sleeps 1.5s before the wait loop starts, so the window the
+	// loop actually runs in is ctx minus ~1.6s of setup. 4s - 1.6s = ~2.4s of
+	// looping: bounded cadence is ~24 reads, a busy loop execs hundreds.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	_, _, _ = h.Send(ctx, key, "run test", nil) // context deadline ends the wait
+
+	data, err := os.ReadFile(eventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	getCalls := strings.Count(string(data), "agent-get")
+	// ~2.4 s of looping at 100 ms cadence is ~24 reads; a busy loop execs hundreds.
+	if getCalls > 60 {
+		t.Fatalf("agent get was called %d times in the window: unknown status busy-loops", getCalls)
+	}
+	if strings.Contains(string(data), "tab-closed") {
+		t.Fatalf("tab was closed on unknown status without stable idle; events:\n%s", string(data))
+	}
+}
