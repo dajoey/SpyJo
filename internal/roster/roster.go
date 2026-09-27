@@ -342,11 +342,15 @@ func (r *Roster) Assign(stateDir, name, sessionKey string, now time.Time) (strin
 	// prior choice only while the roster still routes this role through it --
 	// a tripped daily_cap still leaves a running session where it is, but a
 	// reseat changes `name` and lets the session move.
-	if prior, ok := u.Seen[sessionKey]; ok && sessionKey != "" && r.Has(prior) && r.routesThrough(name, prior) {
+	// A "stop" decision halts the staff at once, so a session already on a stopped staff
+	// re-derives instead of keeping it (found 2026-09-27: a recovery session went back to a
+	// Cursor seat stopped for a spent plan and lost an attempt). A tripped daily_cap alone
+	// still leaves a running session where it is.
+	decided := loadDecisions(stateDir, today)
+	if prior, ok := u.Seen[sessionKey]; ok && sessionKey != "" && r.Has(prior) && r.routesThrough(name, prior) && decided[prior] != DecisionStop {
 		return prior, nil
 	}
 
-	decided := loadDecisions(stateDir, today)
 	chosen := name
 	for hop := 0; hop < maxFallback; hop++ {
 		s := r.Staff[chosen]
