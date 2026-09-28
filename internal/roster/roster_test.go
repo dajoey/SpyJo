@@ -236,6 +236,10 @@ func TestNotifyAtAsksOnceAndJoeyDecides(t *testing.T) {
 	run(dir, r, []string{"a6"}, "principal")
 	decide(dir, DecisionStop)
 	run(dir, r, []string{"a7"}, "thinker")
+	// A session already given principal today (a6) must move too: "stop" halts the staff at
+	// once. Found live 2026-09-27: a recovery session for an attempt that began on a Cursor seat
+	// went back to that seat after its stop decision, hit the spent plan and lost an attempt.
+	run(dir, r, []string{"a6"}, "thinker")
 
 	if _, err := Load(write(t, strings.Replace(notifySample, "notify_at: 2", "notify_at: 4", 1))); err == nil {
 		t.Fatal("notify_at at or above daily_cap must fail")

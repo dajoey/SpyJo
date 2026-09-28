@@ -164,6 +164,22 @@ func TestCleanHerdrTerminalOutput(t *testing.T) {
 	}
 }
 
+func TestCleanHerdrTerminalOutputAgy1212Composer(t *testing.T) {
+	fixturePath := filepath.Join(os.Getenv("HOME"), "ops/tests/fixtures/herdr-agy/control-idle-composer.txt")
+	content, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Skipf("skipping fixture test: %v", err)
+	}
+	raw := string(content)
+	if !agyInputBoxPattern.MatchString(raw) {
+		t.Fatalf("agyInputBoxPattern did not match 1.2.12 composer in %s", fixturePath)
+	}
+	cleaned := cleanHerdrTerminalOutput(raw)
+	if strings.Contains(cleaned, ">") || strings.Contains(cleaned, "? for shortcuts") || strings.Contains(cleaned, "───") {
+		t.Fatalf("cleanHerdrTerminalOutput did not strip composer from output:\n%s", cleaned)
+	}
+}
+
 func TestWorkerNameAndLabelSiblingHelmIDsDoNotCollide(t *testing.T) {
 	// Real sibling Helm task IDs from 2026-09-22 agent_name_taken (errors.jsonl).
 	// Distinguishing tails sit past the old 32-char head truncate, so both used to

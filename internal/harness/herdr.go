@@ -35,6 +35,10 @@ type Herdr struct {
 	sessions map[string]string
 	active   map[string]*herdrTurn
 	closed   bool
+
+	idleStabilityCount    int
+	idleStabilityInterval time.Duration
+	composerWaitTimeout   time.Duration
 }
 
 type herdrTurn struct {
@@ -112,13 +116,30 @@ func NewHerdr(cfg HarnessConfig) (*Herdr, error) {
 		cfg.Cwd = "."
 	}
 	h := &Herdr{
-		config:   cfg,
-		keyLocks: map[string]*sync.Mutex{},
-		sessions: map[string]string{},
-		active:   map[string]*herdrTurn{},
+		config:                cfg,
+		keyLocks:              map[string]*sync.Mutex{},
+		sessions:              map[string]string{},
+		active:                map[string]*herdrTurn{},
+		idleStabilityCount:    3,
+		idleStabilityInterval: 2 * time.Second,
 	}
 	_ = h.loadSessions()
 	return h, nil
+}
+
+// SetIdleStability configures the number of consecutive idle readings required
+// and the interval between checks before considering a worker turn complete.
+func (h *Herdr) SetIdleStability(count int, interval time.Duration) {
+	h.idleStabilityCount = count
+	h.idleStabilityInterval = interval
+}
+
+// SetComposerWaitTimeout configures the maximum time to wait for a runner's
+// composer to become visible after launch or when recovering from an undelivered prompt.
+func (h *Herdr) SetComposerWaitTimeout(d time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.composerWaitTimeout = d
 }
 
 func (h *Herdr) Start(ctx context.Context) error {
@@ -424,6 +445,12 @@ func fitHerdrWorkerName(prefix, body, hashSource string) string {
 	return strings.Trim(result, "-_")
 }
 
+// WorkerNameForKey returns the deterministic Herdr worker agent name for a session key.
+func WorkerNameForKey(key string) string {
+	name, _ := workerNameAndLabel(key, "")
+	return name
+}
+
 func workerNameAndLabel(key, model string) (workerName string, tabLabel string) {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "default" {
@@ -678,8 +705,13 @@ func (h *Herdr) resolveTarget(ctx context.Context, key string, model string, cwd
 			threadID = getResp.Result.Agent.AgentSession.Value
 		}
 	}
-	// Brief settle pause to let agent terminal finish initialization and input binding
-	time.Sleep(1500 * time.Millisecond)
+	composerTimeout := h.composerWaitTimeout
+	if composerTimeout <= 0 {
+		composerTimeout = 30 * time.Second
+	}
+	if sid := h.waitForRunnerComposer(ctx, expectedWorkerName, model, composerTimeout); sid != "" {
+		threadID = sid
+	}
 
 	return expectedWorkerName, newPaneID, createdTabID, true, threadID, nil
 }
@@ -731,6 +763,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	h.active[key] = turn
 	h.mu.Unlock()
 
+	var turnSuccess bool
 	cleanKey := strings.TrimSpace(key)
 	defer func() {
 		cancel()
@@ -738,7 +771,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		delete(h.active, key)
 		h.mu.Unlock()
 		close(turn.done)
-		if isOrchestratorKey(cleanKey) {
+		if turnSuccess && isOrchestratorKey(cleanKey) {
 			go h.cleanupCompletedTab(key, tabID, paneID, target)
 		}
 	}()
@@ -793,18 +826,28 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	// working. Treating that as a failure closed the worker tab mid-task and sent
 	// a recovery agent to redo the work (8 times 2026-09-15..17, spyjo-observer).
 	// Keep waiting while herdr still reports the agent working, up to a ceiling.
+	runner := func(ctx context.Context, args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, h.config.Command, args...)
+		turn.cmd = cmd
+		return cmd.CombinedOutput()
+	}
+	status := func(text string) {
+		if emit != nil {
+			emit(core.Event{Kind: core.EventStatus, Text: text})
+		}
+	}
+
 	if promptErr != nil && isHerdrWaitTimeout(string(promptOut)) {
-		promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling,
-			func(ctx context.Context, args ...string) ([]byte, error) {
-				cmd := exec.CommandContext(ctx, h.config.Command, args...)
-				turn.cmd = cmd
-				return cmd.CombinedOutput()
-			},
-			func(text string) {
-				if emit != nil {
-					emit(core.Event{Kind: core.EventStatus, Text: text})
-				}
-			})
+		promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling, runner, status)
+	}
+
+	// Idle stability check: herdr screen detection can momentarily classify an
+	// in-flight agent frame as idle mid-turn. If prompt --wait (or wait extension)
+	// exited ok, verify that the idle reading is stable by checking agent status
+	// repeatedly over a short window before closing the tab. If any check reports
+	// working, re-enter extendHerdrWait to keep waiting.
+	if promptErr == nil {
+		promptErr = h.checkIdleStability(turnContext, target, runner, status)
 	}
 
 	close(streamDone)
@@ -818,6 +861,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 	getOut, getErr := getCmd.Output()
 	var agentStatus string
 	var agentKind string
+	var hasRealSession bool
 	if getErr == nil {
 		var getResp herdrAgentGetResponse
 		if json.Unmarshal(getOut, &getResp) == nil {
@@ -825,14 +869,10 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 			agentKind = getResp.Result.Agent.Agent
 			if getResp.Result.Agent.AgentSession.Value != "" {
 				threadID = getResp.Result.Agent.AgentSession.Value
+				hasRealSession = true
 			}
 		}
 	}
-
-	if threadID == "" {
-		threadID = fmt.Sprintf("herdr:%s:%d", target, time.Now().Unix())
-	}
-	h.rememberSession(key, threadID)
 
 	// Fetch and clean final response text
 	var finalText string
@@ -854,6 +894,96 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 			}
 		}
 	}
+
+	// Guard against undelivered prompt on newly spawned pane:
+	// If prompt --wait returned ok on a pane spawned for this turn, but there is
+	// still no agent session and no new transcript, the prompt was typed into a
+	// terminal that the worker was not yet reading.
+	if promptErr == nil && turn.isDynamic && !hasRealSession && finalText == "" {
+		if emit != nil {
+			emit(core.Event{
+				Kind:      core.EventStatus,
+				Text:      fmt.Sprintf("prompt_not_delivered: worker %s produced no session or transcript; waiting for composer before re-sending", target),
+				Execution: &core.ExecutionStatus{State: "running", Detail: "prompt_not_delivered: waiting for composer"},
+			})
+		}
+
+		// Re-send once after the runner's composer is visible
+		composerTimeout := h.composerWaitTimeout
+		if composerTimeout <= 0 {
+			composerTimeout = 30 * time.Second
+		}
+		if sid := h.waitForRunnerComposer(turnContext, target, cfg.Model, composerTimeout); sid != "" {
+			threadID = sid
+			hasRealSession = true
+		}
+
+		rePromptStart := time.Now()
+		promptCmd = exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
+		turn.cmd = promptCmd
+		promptOut, promptErr = promptCmd.CombinedOutput()
+
+		if promptErr != nil && strings.Contains(string(promptOut), "agent_prompt_stalled") {
+			time.Sleep(2000 * time.Millisecond)
+			promptCmd = exec.CommandContext(turnContext, h.config.Command, "agent", "prompt", target, prompt, "--wait", "--timeout", "900000")
+			turn.cmd = promptCmd
+			promptOut, promptErr = promptCmd.CombinedOutput()
+		}
+
+		if promptErr != nil && isHerdrWaitTimeout(string(promptOut)) {
+			promptOut, promptErr = extendHerdrWait(turnContext, target, promptOut, promptErr, herdrWaitCeiling, runner, status)
+		}
+
+		if promptErr == nil {
+			promptErr = h.checkIdleStability(turnContext, target, runner, status)
+		}
+
+		getCmd = exec.Command(h.config.Command, "agent", "get", target)
+		if getOut, getErr = getCmd.Output(); getErr == nil {
+			var getResp herdrAgentGetResponse
+			if json.Unmarshal(getOut, &getResp) == nil {
+				agentStatus = getResp.Result.Agent.AgentStatus
+				agentKind = getResp.Result.Agent.Agent
+				if getResp.Result.Agent.AgentSession.Value != "" {
+					threadID = getResp.Result.Agent.AgentSession.Value
+					hasRealSession = true
+				}
+			}
+		}
+
+		if agentKind == "opencode" || strings.HasPrefix(threadID, "ses_") {
+			if text, err := extractOpencodeMessage(threadID); err == nil && strings.TrimSpace(text) != "" {
+				finalText = text
+			}
+		}
+		if finalText == "" {
+			if path := transcriptPath(agentKind, threadID, cfg.Cwd); path != "" {
+				if text, err := extractTranscriptMessage(path, rePromptStart); err == nil {
+					finalText = text
+				}
+			}
+		}
+
+		// If that also yields nothing, return an error that Spynel retries in place, never EventFinal.
+		if promptErr != nil || (!hasRealSession && finalText == "") {
+			notDeliveredErr := fmt.Errorf("prompt_not_delivered: worker %s never received prompt, please retry", target)
+			if emit != nil {
+				emit(core.Event{
+					Kind:      core.EventError,
+					Text:      notDeliveredErr.Error(),
+					ThreadID:  threadID,
+					Done:      true,
+					Execution: &core.ExecutionStatus{State: "error", Detail: "prompt_not_delivered"},
+				})
+			}
+			return threadID, false, notDeliveredErr
+		}
+	}
+
+	if threadID == "" {
+		threadID = fmt.Sprintf("herdr:%s:%d", target, time.Now().Unix())
+	}
+	h.rememberSession(key, threadID)
 
 	if finalText == "" {
 		finalOut, _ := exec.Command(h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "250").Output()
@@ -915,6 +1045,7 @@ func (h *Herdr) sendInternal(ctx context.Context, key, prompt string, cfg Harnes
 		})
 	}
 
+	turnSuccess = true
 	return threadID, false, nil
 }
 
@@ -936,10 +1067,11 @@ var (
 		regexp.MustCompile(`(?m)^\s*───{5,}.*$`),
 	}
 	herdrThoughtPattern = regexp.MustCompile(`(?s)(?:^|\n)\s*Thought:\s*[^\n]+\n+(.*?)(?:\n\s*\n\s*([^\s].*)|$)`)
-	hermesBoxPattern    = regexp.MustCompile(`(?s)╭─\s*⚕\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
-	hermesReasoningBox  = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
-	kimiInputBoxPattern = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
-	agyInputBoxPattern  = regexp.MustCompile(`(?s)╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯`)
+	hermesBoxPattern      = regexp.MustCompile(`(?s)╭─\s*[⚕☤]\s*Hermes[^\n]*\n(.*?)\n╰[─]+╯`)
+	hermesReasoningBox    = regexp.MustCompile(`(?s)┌─\s*Reasoning[^\n]*\n.*?└[─]+┘\n*`)
+	kimiInputBoxPattern   = regexp.MustCompile(`(?s)╭[─]+╮\s*\n\s*│\s*>\s*\n\s*╰[─]+╯`)
+	agyInputBoxPattern    = regexp.MustCompile(`(?s)(?:╭─+╮\s*\n\s*│\s*Message (?:Antigravity|agy|SpyJo)[^\n]*\n\s*╰─+╯|─{5,}\s*\n[ \t]*>[^\n]*\n[ \t]*─{5,}(?:\s*\n[^\n]*\? for shortcuts[^\n]*)?)`)
+	hermesComposerPattern = regexp.MustCompile(`(?s)(?:─{5,}\s*\n[ \t]*(?:[\w.-]+[ \t]+)?❯.*?\n[ \t]*─{5,}|[⚕☤]\s+\S+\s+│[^\n]*\n[ \t]*─{5,}\s*\n.*?\n[ \t]*─{5,})`)
 )
 
 // cleanHerdrTerminalOutput strips prompt echoes, terminal footers, and internal thought blocks
@@ -958,6 +1090,9 @@ func cleanHerdrTerminalOutput(text string) string {
 
 	// Strip Antigravity / SpyJo bottom input box if present
 	text = agyInputBoxPattern.ReplaceAllString(text, "")
+
+	// Strip Hermes bottom composer if present
+	text = hermesComposerPattern.ReplaceAllString(text, "")
 
 	lines := strings.Split(text, "\n")
 	var cleanedLines []string
@@ -989,6 +1124,173 @@ func cleanHerdrTerminalOutput(text string) string {
 	}
 
 	return strings.TrimSpace(text)
+}
+
+func (h *Herdr) checkIdleStability(turnContext context.Context, target string, runner herdrRunner, status func(string)) error {
+	stabilityCount := h.idleStabilityCount
+	if stabilityCount <= 0 {
+		stabilityCount = 3
+	}
+	interval := h.idleStabilityInterval
+	if interval <= 0 && h.idleStabilityCount == 0 {
+		interval = 2 * time.Second
+	}
+	consecutiveIdle := 0
+	for consecutiveIdle < stabilityCount {
+		if turnContext.Err() != nil {
+			return turnContext.Err()
+		}
+		getOut, getErr := runner(turnContext, "agent", "get", target)
+		if getErr != nil {
+			break
+		}
+		var getResp herdrAgentGetResponse
+		if json.Unmarshal(getOut, &getResp) != nil {
+			break
+		}
+		agentSt := getResp.Result.Agent.AgentStatus
+		switch agentSt {
+		case "idle", "done":
+			consecutiveIdle++
+			if consecutiveIdle < stabilityCount && interval > 0 {
+				select {
+				case <-turnContext.Done():
+					return turnContext.Err()
+				case <-time.After(interval):
+				}
+				if turnContext.Err() != nil {
+					return turnContext.Err()
+				}
+			}
+		case "working":
+			consecutiveIdle = 0
+			var promptErr error
+			_, promptErr = extendHerdrWait(turnContext, target, nil, errors.New("agent still working"), herdrWaitCeiling, runner, status)
+			if promptErr != nil {
+				return promptErr
+			}
+		case "blocked":
+			return errors.New("agent_blocked")
+		default:
+			// Unknown status (a future herdr value): neither evidence of idle
+			// nor of work. Do not count it and do not busy-loop; wait one
+			// interval before re-reading (reviewer hardening note 2026-09-27).
+			if interval > 0 {
+				select {
+				case <-turnContext.Done():
+					return turnContext.Err()
+				case <-time.After(interval):
+				}
+				if turnContext.Err() != nil {
+					return turnContext.Err()
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isRunnerComposerVisible reports whether the screen contains the interactive composer
+// or ready input line for the specified runner kind.
+func isRunnerComposerVisible(model, screen string) bool {
+	clean := strings.TrimSpace(screen)
+	if clean == "" {
+		return false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(model, "agy") || strings.Contains(model, "antigravity") || strings.Contains(model, "gemini"):
+		if agyInputBoxPattern.MatchString(screen) {
+			return true
+		}
+		if strings.Contains(screen, "? for shortcuts") && !strings.Contains(screen, "esc to cancel") {
+			return true
+		}
+		return false
+	case strings.Contains(model, "kimi"):
+		if kimiInputBoxPattern.MatchString(screen) || strings.Contains(screen, "│ >") {
+			return true
+		}
+		return false
+	case strings.Contains(model, "hermes"):
+		if strings.Contains(screen, "msg=interrupt") || strings.Contains(screen, "☤ ❯") {
+			return false
+		}
+		if hermesComposerPattern.MatchString(screen) || hermesBoxPattern.MatchString(screen) {
+			return true
+		}
+		return false
+	case strings.Contains(model, "opencode"):
+		if strings.Contains(screen, "ctrl+p commands") || strings.Contains(screen, "• OpenCode") || strings.Contains(screen, "Ask anything...") {
+			return true
+		}
+		return false
+	case strings.Contains(model, "pi"):
+		if strings.Contains(screen, "π -") || strings.Contains(screen, "❯") {
+			return true
+		}
+		return false
+	default:
+		if agyInputBoxPattern.MatchString(screen) || kimiInputBoxPattern.MatchString(screen) || hermesComposerPattern.MatchString(screen) || hermesBoxPattern.MatchString(screen) {
+			return true
+		}
+		if strings.Contains(screen, "? for shortcuts") && !strings.Contains(screen, "esc to cancel") {
+			return true
+		}
+		if strings.Contains(screen, "ctrl+p commands") {
+			return true
+		}
+		return false
+	}
+}
+
+// waitForRunnerComposer waits up to maxWait for the runner's composer to be visible
+// on the terminal screen, returning any active agent session ID discovered during the wait.
+func (h *Herdr) waitForRunnerComposer(ctx context.Context, target, model string, maxWait time.Duration) string {
+	if maxWait <= 0 {
+		maxWait = 30 * time.Second
+	}
+	deadline := time.Now().Add(maxWait)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	var sessionID string
+	for {
+		// 1. Check agent state and session
+		getCmd := exec.CommandContext(ctx, h.config.Command, "agent", "get", target)
+		if getOut, getErr := getCmd.Output(); getErr == nil {
+			var getResp herdrAgentGetResponse
+			if json.Unmarshal(getOut, &getResp) == nil {
+				if getResp.Result.Agent.AgentSession.Value != "" {
+					sessionID = getResp.Result.Agent.AgentSession.Value
+				}
+			}
+		}
+
+		// 2. Read recent terminal output to inspect composer
+		readCmd := exec.CommandContext(ctx, h.config.Command, "agent", "read", target, "--source", "recent-unwrapped", "--lines", "100")
+		if readOut, readErr := readCmd.Output(); readErr == nil {
+			if isRunnerComposerVisible(model, string(readOut)) {
+				time.Sleep(100 * time.Millisecond)
+				return sessionID
+			}
+		}
+
+		if sessionID != "" && !strings.Contains(strings.ToLower(model), "agy") && !strings.Contains(strings.ToLower(model), "antigravity") && !strings.Contains(strings.ToLower(model), "hermes") {
+			return sessionID
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return sessionID
+		case <-ticker.C:
+		}
+	}
+	return sessionID
 }
 
 // extractOpencodeMessage queries OpenCode's local database for the latest assistant message in a session.
