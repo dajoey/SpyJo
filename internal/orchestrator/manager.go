@@ -57,6 +57,12 @@ type Lease struct {
 	Phase             string    `json:"phase,omitempty"`
 	ClaimAttempt      int       `json:"claim_attempt,omitempty"`
 	ImplementerThread string    `json:"implementer_thread,omitempty"`
+	// TargetModel is the model string this dispatch actually steered the
+	// harness to (resolveTargetModel). recordQuotaError reads it to find the
+	// usage plan the quota wall hit: roster-routed documents carry no
+	// agent/runner pin, so without it every such park named "default" and
+	// woke a blind hour later (found live 2026-09-28).
+	TargetModel string `json:"target_model,omitempty"`
 	// ReviewRisk is the task's risk when Spynel claimed it for review:
 	// reviewRiskHigh or reviewRiskRoutine. Empty means unknown (an older
 	// lease, or a review adopted without a claim) and never earns a credit.
@@ -837,6 +843,17 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// until reconciliation observes the agent-authored durable file move.
 		}
 		targetModel := m.resolveTargetModel(route, lease)
+		// Record what this dispatch actually runs on before the send: a quota
+		// park must wake at the plan's real reset, and the model string (not
+		// the document, which roster-routed work never pins) is the only
+		// place the chosen seat is named. The send has not started, so no
+		// event save can race this one.
+		if lease.TargetModel != targetModel {
+			lease.TargetModel = targetModel
+			if saveErr := m.saveLease(lease); saveErr != nil {
+				m.log("save lease target model: " + saveErr.Error())
+			}
+		}
 		var threadID string
 		var steered bool
 		for sendAttempt := 0; ; sendAttempt++ {
@@ -2638,7 +2655,102 @@ var (
 		"agy":      "antigravity",
 		"pi":       "zai",
 	}
+	// providerPlanMap is the provider-prefix half of the plan lookup, the
+	// same table ~/ops/spyjo-quota-gate.py's PLAN_BY_PROVIDER uses, so the
+	// orchestrator and the gate can never disagree about which plan a
+	// provider/model pin spends.
+	providerPlanMap = map[string]string{
+		"opencode-go":     "opencode_go",
+		"zai":             "zai",
+		"zai-coding-plan": "zai",
+		"kimi":            "kimi_coding",
+		"kimi-for-coding": "kimi_coding",
+		"kimi-code":       "kimi_coding",
+		"antigravity":     "antigravity",
+	}
 )
+
+// quotaPlanForModelString maps a harness model string to the usage plan it
+// spends: the provider prefix of a "provider/model" pin through
+// providerPlanMap, else the legacy runner-name map for bare runner strings.
+func quotaPlanForModelString(model string) string {
+	if p := strings.IndexByte(model, '/'); p > 0 {
+		return providerPlanMap[model[:p]]
+	}
+	return runnerPlanMap[model]
+}
+
+// quotaPlanForTargetModel resolves the usage plan a dispatch's target model
+// spends. A roster seat ("@name") is looked up read-only; everything else
+// goes through quotaPlanForModelString. An empty result means unmetered or
+// unknown, and the caller falls back to the legacy document path.
+func (m *Manager) quotaPlanForTargetModel(targetModel string) string {
+	if seat, ok := strings.CutPrefix(targetModel, roster.StaffPrefix); ok {
+		return m.quotaPlanForStaff(seat)
+	}
+	return quotaPlanForModelString(targetModel)
+}
+
+// quotaPlanForStaff resolves the usage plan a roster seat spends, read-only
+// by design: roster.Load plus a staff lookup, never staffing.Assign, which
+// counts a usage session — the dispatch already paid that count when it
+// chose the seat. Mirrors the quota gate: agy always spends the antigravity
+// plan; a pinned "--model" names the plan through its provider prefix; a
+// seat without a pinned model spends its runner's default plan.
+func (m *Manager) quotaPlanForStaff(seat string) string {
+	staffing, loadErr := roster.Load(m.Config.StatePath())
+	if loadErr != nil || staffing == nil {
+		return ""
+	}
+	s, ok := staffing.Staff[seat]
+	if !ok {
+		return ""
+	}
+	if s.Runner == "agy" {
+		return "antigravity"
+	}
+	for i := 0; i+1 < len(s.Args); i++ {
+		if s.Args[i] == "--model" {
+			return quotaPlanForModelString(s.Args[i+1])
+		}
+	}
+	return runnerPlanMap[s.Runner]
+}
+
+// quotaNameForTargetModel names what hit the wall in the park note: the seat
+// for a roster seat, the model string itself for runner and provider/model
+// pins (the legacy note already named those verbatim).
+func quotaNameForTargetModel(targetModel string) string {
+	if seat, ok := strings.CutPrefix(targetModel, roster.StaffPrefix); ok {
+		return seat
+	}
+	return targetModel
+}
+
+// quotaWallNameAndPlan names what hit the quota wall and the usage plan the
+// dispatch actually spent. The lease's recorded target model is
+// authoritative: roster-routed documents carry no agent/runner pin, so
+// before it every such park named "default" and woke a blind hour later.
+// The document pin stays the legacy path for leases dispatched before the
+// field was recorded.
+func (m *Manager) quotaWallNameAndPlan(document Document, readErr error, lease Lease) (name, planKey string) {
+	if lease.TargetModel != "" {
+		name = quotaNameForTargetModel(lease.TargetModel)
+		planKey = m.quotaPlanForTargetModel(lease.TargetModel)
+	} else if readErr != nil {
+		return "default", "default"
+	} else {
+		name = resolveRunnerName(document, lease)
+		planKey = runnerPlanMap[name]
+	}
+	if planKey == "" {
+		// Same shape as the legacy lookup: an unmetered or unknown name is
+		// still looked up verbatim, so it misses the snapshot and parks the
+		// blind hour instead of guessing a plan.
+		planKey = name
+	}
+	return name, planKey
+}
 
 func parseQuotaResetTime(errMsg string, now time.Time) (time.Time, bool) {
 	if match := rfc3339Regex.FindString(errMsg); match != "" {
@@ -2654,7 +2766,14 @@ func parseQuotaResetTime(errMsg string, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func readSnapshotResetTime(runner string, now time.Time) (time.Time, bool) {
+// readSnapshotResetTime reads the wake time for a usage plan from the quota
+// gate's snapshot: the LATEST reset among its exhausted (100%) windows — the
+// plan is unusable until every exhausted window clears, so the earliest would
+// wake at a window that is still full and re-hit the wall (found live
+// 2026-09-28). With no exhausted window it keeps the legacy earliest-future-
+// reset heuristic for a stale snapshot. planKey is the plan's snapshot key,
+// already resolved by the caller.
+func readSnapshotResetTime(planKey string, now time.Time) (time.Time, bool) {
 	if usageSnapshotPath == "" {
 		return time.Time{}, false
 	}
@@ -2667,10 +2786,6 @@ func readSnapshotResetTime(runner string, now time.Time) (time.Time, bool) {
 	}
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return time.Time{}, false
-	}
-	planKey := runnerPlanMap[runner]
-	if planKey == "" {
-		planKey = runner
 	}
 	planData, ok := snap.Plans[planKey]
 	if !ok || planData == nil {
@@ -2696,7 +2811,7 @@ func readSnapshotResetTime(runner string, now time.Time) (time.Time, bool) {
 
 		pct := numberValue(windowMap["pct"])
 		if pct >= 100 {
-			if exhaustedReset.IsZero() || t.Before(exhaustedReset) {
+			if exhaustedReset.IsZero() || t.After(exhaustedReset) {
 				exhaustedReset = t
 			}
 		}
@@ -2714,11 +2829,11 @@ func readSnapshotResetTime(runner string, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func resolveQuotaResetTime(errMsg, runner string, now time.Time) time.Time {
+func resolveQuotaResetTime(errMsg, planKey string, now time.Time) time.Time {
 	if t, ok := parseQuotaResetTime(errMsg, now); ok {
 		return t
 	}
-	if t, ok := readSnapshotResetTime(runner, now); ok {
+	if t, ok := readSnapshotResetTime(planKey, now); ok {
 		return t
 	}
 	return now.Add(1 * time.Hour)
@@ -2727,11 +2842,8 @@ func resolveQuotaResetTime(errMsg, runner string, now time.Time) time.Time {
 func (m *Manager) recordQuotaError(lease Lease, err error) {
 	now := time.Now().UTC()
 	document, readErr := ReadDocument(lease.File)
-	runner := "default"
-	if readErr == nil {
-		runner = resolveRunnerName(document, lease)
-	}
-	resetTime := resolveQuotaResetTime(err.Error(), runner, now)
+	runner, planKey := m.quotaWallNameAndPlan(document, readErr, lease)
+	resetTime := resolveQuotaResetTime(err.Error(), planKey, now)
 	resetTimeStr := resetTime.UTC().Format(time.RFC3339)
 
 	route, ok := routeByName(lease.Route)

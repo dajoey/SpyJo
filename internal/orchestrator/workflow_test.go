@@ -13,6 +13,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/roster"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -1632,6 +1633,163 @@ func TestQuotaErrorParksUntilResetWithoutSpendingAttempt(t *testing.T) {
 		}
 		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
 			t.Fatalf("resume_credit was not set: %#v", doc.FrontMatter)
+		}
+	}
+}
+
+// TestQuotaErrorParksAtRealPlanResetForRosterRoutedTasks pins the 2026-09-28
+// quota-wall defects: every roster-routed park (no agent/runner pin; the seat
+// is chosen at dispatch) named "default" and woke a blind hour later because
+// recordQuotaError resolved the runner only from the document, and
+// readSnapshotResetTime returned the EARLIEST reset among exhausted windows,
+// so a plan with a short and a long window both at 100% woke at the short one
+// and re-hit the wall until the long one cleared.
+func TestQuotaErrorParksAtRealPlanResetForRosterRoutedTasks(t *testing.T) {
+	writeRoster := func(t *testing.T, cfg config.Config) {
+		t.Helper()
+		rosterBody := `
+staff:
+  implementer: {runner: opencode, args: ["--model", "opencode-go/glm-5.3"]}
+  zai-code: {runner: pi, args: ["--model", "zai/glm-5.3"]}
+roles:
+  task_implementation: implementer
+`
+		if err := os.MkdirAll(cfg.StatePath(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(roster.Path(cfg.StatePath()), []byte(rosterBody), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSnapshot := func(t *testing.T, snapContent string) {
+		t.Helper()
+		snapFile := filepath.Join(t.TempDir(), "snapshot.json")
+		if err := os.WriteFile(snapFile, []byte(snapContent), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		origSnapshot := usageSnapshotPath
+		usageSnapshotPath = snapFile
+		t.Cleanup(func() { usageSnapshotPath = origSnapshot })
+	}
+	resetStamp := func(d time.Duration) string {
+		return time.Now().Add(d).UTC().Truncate(time.Second).Format(time.RFC3339)
+	}
+
+	// (a) role-routed seat (no agent/runner pin): the wake is the plan's LAST
+	// exhausted reset and the note names the seat, not "default".
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		writeRoster(t, cfg)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 role-routed seat", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+
+		rollingReset := resetStamp(3 * time.Hour)
+		weeklyReset := resetStamp(4 * 24 * time.Hour)
+		writeSnapshot(t, fmt.Sprintf(`{"plans":{"opencode_go":{"rolling":{"pct":100,"resets_at":"%s"},"weekly":{"pct":100,"resets_at":"%s"}}}}`, rollingReset, weeklyReset))
+
+		fake.sendErrs = []error{errors.New("429 Too Many Requests")}
+		scanAndWait(t, manager)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		if doc.FrontMatter["wake_at"] != weeklyReset {
+			t.Errorf("wake_at = %v, want the weekly (last exhausted) reset %s", doc.FrontMatter["wake_at"], weeklyReset)
+		}
+		if doc.FrontMatter["quota_reset_at"] != weeklyReset {
+			t.Errorf("quota_reset_at = %v, want %s", doc.FrontMatter["quota_reset_at"], weeklyReset)
+		}
+		if strings.Contains(doc.Body, "quota wall on default") {
+			t.Errorf("note still names the default runner: %s", doc.Body)
+		}
+		if !strings.Contains(doc.Body, "quota wall on implementer; parked until "+weeklyReset+"; attempt not spent") {
+			t.Errorf("progress note missing seat name: %s", doc.Body)
+		}
+		if credit, _ := doc.FrontMatter[resumeCreditField].(bool); !credit {
+			t.Errorf("resume_credit was not set: %#v", doc.FrontMatter)
+		}
+		leases, _ := manager.loadLeases()
+		if len(leases) != 0 {
+			t.Errorf("lease still exists: %#v", leases)
+		}
+	}
+
+	// (b) staff-pinned pi zai seat: plan zai, two exhausted windows, the wake
+	// is the LATER one.
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		writeRoster(t, cfg)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 staff-pinned zai seat", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		editFrontMatter(t, task, func(fm map[string]any) {
+			fm["staff"] = "zai-code"
+		})
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+
+		fiveHourReset := resetStamp(1 * time.Hour)
+		weeklyReset := resetStamp(2 * 24 * time.Hour)
+		writeSnapshot(t, fmt.Sprintf(`{"plans":{"zai":{"five_hour":{"pct":100,"resets_at":"%s"},"weekly":{"pct":100,"resets_at":"%s"}}}}`, fiveHourReset, weeklyReset))
+
+		fake.sendErrs = []error{errors.New("429 rate limit exceeded")}
+		scanAndWait(t, manager)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		if doc.FrontMatter["wake_at"] != weeklyReset {
+			t.Errorf("wake_at = %v, want the weekly (last exhausted) reset %s", doc.FrontMatter["wake_at"], weeklyReset)
+		}
+		if !strings.Contains(doc.Body, "quota wall on zai-code; parked until "+weeklyReset+"; attempt not spent") {
+			t.Errorf("progress note missing seat name: %s", doc.Body)
+		}
+	}
+
+	// (c) legacy agent pin, two exhausted windows: the wake is the LATER one
+	// on the legacy path too (readSnapshotResetTime used to return the
+	// earliest).
+	{
+		cfg, fake, manager := workflowTestManager(t)
+		route := workflowRoutes()[0]
+		task, err := Create(cfg, "tasks", "task 429 legacy latest exhausted", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		editFrontMatter(t, task, func(fm map[string]any) {
+			fm["agent"] = "kimi"
+		})
+		name := filepath.Base(task)
+		base := filepath.Dir(cfg.Resolve(route.Source))
+
+		fiveHourReset := resetStamp(45 * time.Minute)
+		weeklyReset := resetStamp(2 * 24 * time.Hour)
+		writeSnapshot(t, fmt.Sprintf(`{"plans":{"kimi_coding":{"five_hour":{"pct":100,"resets_at":"%s"},"weekly":{"pct":100,"resets_at":"%s"}}}}`, fiveHourReset, weeklyReset))
+
+		fake.sendErrs = []error{errors.New("429 Too Many Requests")}
+		scanAndWait(t, manager)
+
+		waitingPath := filepath.Join(base, "waiting", name)
+		doc, err := ReadDocument(waitingPath)
+		if err != nil {
+			t.Fatalf("task was not parked in waiting/: %v", err)
+		}
+		if doc.FrontMatter["wake_at"] != weeklyReset {
+			t.Errorf("wake_at = %v, want the weekly (last exhausted) reset %s", doc.FrontMatter["wake_at"], weeklyReset)
+		}
+		if !strings.Contains(doc.Body, "quota wall on kimi; parked until "+weeklyReset+"; attempt not spent") {
+			t.Errorf("progress note missing runner name: %s", doc.Body)
 		}
 	}
 }
